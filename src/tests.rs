@@ -30,6 +30,10 @@ impl Tree {
     }
 
     fn run(&self, pull: bool, opts: &Opts) -> Result<()> {
+        self.with_peer(|host| sync(&self.local, self.remote.to_str().unwrap(), host, "", pull, opts))
+    }
+
+    fn with_peer(&self, client: impl FnOnce(&str) -> Result<()>) -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let host = listener.local_addr()?.to_string();
         let base = self.base.clone();
@@ -39,7 +43,7 @@ impl Tree {
             sock.set_write_timeout(Some(Duration::from_secs(5)))?;
             session(sock, Some(&base), "")
         });
-        let result = sync(&self.local, self.remote.to_str().unwrap(), &host, "", pull, opts);
+        let result = client(&host);
         let server = daemon.join().expect("test daemon panicked");
         result.and(server)
     }
@@ -371,11 +375,123 @@ fn source_scan_error_cannot_turn_into_deletion() {
 }
 
 #[test]
-fn operand_order_is_the_only_direction_switch() {
-    assert_eq!(parse_operands("local", ":/remote").unwrap(), ("local", "/remote", false));
-    assert_eq!(parse_operands(":/remote", "local").unwrap(), ("local", "/remote", true));
-    assert!(parse_operands("local", "remote").is_err());
-    assert!(parse_operands(":a", ":b").is_err());
+fn endpoint_roles_do_not_confuse_windows_drive_paths_with_remote_hosts() {
+    let remote = "100.81.137.14:7777/opt/website";
+    for local in ["website", r"C:\Users\Patrick\repo\website", "C:/Sites/site", r"\\nas\share\site", r"\\?\C:\Sites\site"] {
+        assert_eq!(parse_endpoints(local, remote).unwrap(), (local, "/opt/website", "100.81.137.14:7777", false));
+        assert_eq!(parse_endpoints(remote, local).unwrap(), (local, "/opt/website", "100.81.137.14:7777", true));
+    }
+}
+
+#[test]
+fn remote_endpoint_paths_preserve_unix_windows_and_ipv6_forms() {
+    for (input, host, path) in [
+        ("server:7777/opt/site with spaces", "server:7777", "/opt/site with spaces"),
+        ("server:7777/C:/Sites/website", "server:7777", "C:/Sites/website"),
+        (r"server:7777/C:\Sites\website", "server:7777", r"C:\Sites\website"),
+        (r"server:7777/\\?\C:\Sites\website", "server:7777", r"\\?\C:\Sites\website"),
+        (r"server:7777/\\nas\share\website", "server:7777", r"\\nas\share\website"),
+        ("server:7777//nas/share/website", "server:7777", "//nas/share/website"),
+        ("[::1]:7777/opt/website", "[::1]:7777", "/opt/website"),
+    ] {
+        assert_eq!(remote_endpoint(input).unwrap(), Some((host, path)), "{input}");
+    }
+}
+
+#[test]
+fn malformed_remote_addresses_are_not_reinterpreted_as_local_paths() {
+    for input in ["", ":/opt/site", ":7777/site", "server:7777", "server:/site", "server:abc/site",
+        "server:0/site", "server:65536/site", "server:+7777/site", "server:-1/site",
+        "two hosts:7777/site", "user@server:7777/site", "::1:7777/site", "[bad]:7777/site", "C:relative"] {
+        assert!(remote_endpoint(input).is_err(), "accepted {input:?}");
+    }
+    assert!(parse_endpoints("local", "other-local").is_err());
+    assert!(parse_endpoints("host:7777/source", "host:7777/dest").is_err());
+}
+
+#[test]
+fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resolution() {
+    // The malformed port is intentional: even a parser regression cannot
+    // reach a real peer while these argument-validation cases are checked.
+    for (args, expected) in [
+        (vec![], "missing --source"),
+        (vec!["--dest=host:bad/dest"], "missing --source"),
+        (vec!["--source=local"], "missing --dest"),
+        (vec!["--source=", "--dest=host:bad/dest"], "--source needs a value"),
+        (vec!["--source", "--dest=host:bad/dest"], "--source needs a value"),
+        (vec!["--source=local", "--dest="], "--dest needs a value"),
+        (vec!["--source=local", "--source=other", "--dest=host:bad/dest"], "--source was specified more than once"),
+        (vec!["--dest=host:bad/dest", "--source=local", "--dest=host:bad/other"], "--dest was specified more than once"),
+        (vec!["local", ":/remote", "--host=host:bad"], "unexpected argument"),
+        (vec!["--source=local", "--dest=host:bad/dest", "--delete=false"], "unexpected argument"),
+        (vec!["serve"], "missing --listen"),
+        (vec!["serve", "--listen=host:bad", "--listen=other:bad"], "--listen was specified more than once"),
+    ] {
+        let error = super::run(args.into_iter().map(str::to_owned)).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}; wanted {expected}");
+    }
+}
+
+#[test]
+fn named_flags_transfer_in_both_directions_regardless_of_order_or_equals_style() {
+    for pull in [false, true] {
+        for reversed in [false, true] {
+            for (equals, delete) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut tree = Tree::new();
+                tree.local = tree.base.join("local space=tree");
+                tree.remote = tree.base.join("remote space=tree");
+                fs::create_dir(&tree.local).unwrap();
+                fs::create_dir(&tree.remote).unwrap();
+                let (src, dst) = tree.ends(pull);
+                put(src, "file", b"fresh");
+                put(dst, "file", b"old");
+                put(dst, "extra", b"precious");
+                put(src, "ignored", b"do not send");
+                put(dst, "ignored", b"do not overwrite");
+                tree.with_peer(|host| {
+                    let local = tree.local.to_str().unwrap().to_owned();
+                    let path = tree.remote.to_str().unwrap();
+                    let remote = format!("{host}/{}", path.strip_prefix('/').unwrap_or(path));
+                    let (source, dest) = if pull { (remote, local) } else { (local, remote) };
+                    let mut endpoints = [("--source", source), ("--dest", dest)];
+                    if reversed { endpoints.reverse(); }
+                    let mut args = vec!["--token=".to_owned(), "--ignore=ignored".to_owned()];
+                    if delete { args.push("--delete".into()); }
+                    for (key, value) in endpoints {
+                        if equals { args.push(format!("{key}={value}")); }
+                        else { args.extend([key.to_owned(), value]); }
+                    }
+                    super::run(args.into_iter())
+                }).unwrap();
+                assert_eq!(fs::read(src.join("file")).unwrap(), b"fresh");
+                assert_eq!(fs::read(dst.join("file")).unwrap(), b"fresh");
+                assert_eq!(dst.join("extra").exists(), !delete);
+                assert_eq!(fs::read(dst.join("ignored")).unwrap(), b"do not overwrite");
+            }
+        }
+    }
+}
+
+#[test]
+fn named_cli_dry_run_with_delete_does_not_modify_either_tree() {
+    for pull in [false, true] {
+        let tree = Tree::new();
+        let (src, dst) = tree.ends(pull);
+        put(src, "file", b"fresh");
+        put(dst, "file", b"old");
+        put(dst, "extra", b"precious");
+        let before_local = snapshot(&tree.local);
+        let before_remote = snapshot(&tree.remote);
+        tree.with_peer(|host| {
+            let local = tree.local.to_str().unwrap().to_owned();
+            let path = tree.remote.to_str().unwrap();
+            let remote = format!("{host}/{}", path.strip_prefix('/').unwrap_or(path));
+            let (source, dest) = if pull { (remote, local) } else { (local, remote) };
+            super::run([format!("--dest={dest}"), format!("--source={source}"), "--dry-run".into(), "--delete".into(), "--full".into(), "--token=".into()].into_iter())
+        }).unwrap();
+        assert_eq!(snapshot(&tree.local), before_local);
+        assert_eq!(snapshot(&tree.remote), before_remote);
+    }
 }
 
 #[cfg(unix)]

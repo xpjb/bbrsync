@@ -1,5 +1,5 @@
 //! bbrsync: one-way, content-defined-chunk sync over a trusted TCP connection.
-//! Both directions use the same exchange:
+//! Wire exchange:
 //! receiver Files -> sender Diffs -> receiver Needs -> sender Chunks/Done -> receiver Ok.
 
 use anyhow::{bail, Context, Result};
@@ -718,8 +718,14 @@ fn sync(
     } else {
         local.canonicalize()?
     };
-    let arrow = if pull { "<-" } else { "->" };
-    println!("{arrow} {}  {host}:{remote}", local.display());
+    let local_label = local.display().to_string();
+    let remote_label = format!("{host}/{}", remote.strip_prefix('/').unwrap_or(remote));
+    let (source, dest) = if pull {
+        (&remote_label, &local_label)
+    } else {
+        (&local_label, &remote_label)
+    };
+    println!("source: {source}\ndest:   {dest}");
     let sock = TcpStream::connect(host).with_context(|| format!("connecting to {host}"))?;
     sock.set_nodelay(true).ok();
     let mut w = BufWriter::with_capacity(64 << 10, sock.try_clone()?);
@@ -817,79 +823,136 @@ fn serve(base: Option<&Path>, listen: &str, token: &str) -> Result<()> {
 
 // ------------------------------------------------------------ command line
 
-fn usage() -> ! {
-    eprintln!(
-        "usage:\n  \
-         bbrsync SRC DEST --host HOST:PORT [--token T] [--dry-run] [--full] [--delete] [--ignore P]\n  \
-         bbrsync serve [--root DIR] --listen ADDR [--token T]\n\n\
-         One operand is a local directory, the other is a path on the daemon, written\n\
-         with a leading colon. Which is which decides the direction:\n\n  \
-         bbrsync ./site :/srv/site --host H     push ./site to the daemon\n  \
-         bbrsync :/srv/site ./site --host H     pull /srv/site from the daemon\n\n\
-         --host is HOST:PORT. Nothing is deleted unless --delete is given,\n\
-         and a delete that would remove most of a tree is refused."
-    );
-    std::process::exit(2)
+fn remote_endpoint(value: &str) -> Result<Option<(&str, &str)>> {
+    if value.is_empty() {
+        bail!("endpoint path must not be empty");
+    }
+    let windows_drive = |s: &str| {
+        let b = s.as_bytes();
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':'
+            && matches!(b[2], b'/' | b'\\')
+    };
+    if windows_drive(value) || value.starts_with(r"\\") {
+        return Ok(None);
+    }
+    let authority = value.split('/').next().unwrap();
+    let Some((host, port)) = authority.rsplit_once(':') else { return Ok(None) };
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c == '\\' || c == '@') {
+        bail!("invalid remote host in {value:?}; use HOST:PORT/PATH");
+    }
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit())
+        || !matches!(port.parse::<u16>(), Ok(1..=65535))
+    {
+        bail!("invalid remote port in {value:?}; use HOST:PORT/PATH");
+    }
+    if host.contains([':', '[', ']']) {
+        authority.parse::<std::net::SocketAddr>()
+            .context("IPv6 endpoints must use [ADDRESS]:PORT/PATH")?;
+    }
+    let path = &value[authority.len()..];
+    let tail = path.strip_prefix('/').context("remote endpoint needs a path: HOST:PORT/PATH")?;
+    // The slash separates the authority from an absolute Windows path. For a
+    // Unix path, that same slash is its filesystem root.
+    let path = if windows_drive(tail) || tail.starts_with(r"\\") { tail } else { path };
+    Ok(Some((authority, path)))
 }
 
-fn parse_operands<'a>(a: &'a str, b: &'a str) -> Result<(&'a str, &'a str, bool)> {
-    let remote = |s: &str| s.starts_with(':');
-    match (remote(a), remote(b)) {
-        (true, false) => Ok((b, &a[1..], true)),
-        (false, true) => Ok((a, &b[1..], false)),
-        (false, false) => bail!(
-            "one operand must name a path on the daemon, written with a leading colon, \
-             for example :/srv/site"
-        ),
-        (true, true) => bail!("both operands are daemon-side paths; one must be a local directory"),
+fn parse_endpoints<'a>(source: &'a str, dest: &'a str) -> Result<(&'a str, &'a str, &'a str, bool)> {
+    match (remote_endpoint(source)?, remote_endpoint(dest)?) {
+        (None, Some((host, path))) => Ok((source, path, host, false)),
+        (Some((host, path)), None) => Ok((dest, path, host, true)),
+        (None, None) => bail!("exactly one of --source and --dest must be HOST:PORT/PATH"),
+        (Some(_), Some(_)) => bail!("one endpoint must be local; remote-to-remote sync is not supported"),
     }
 }
 
-fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1).peekable();
-    if args.peek().map(String::as_str) == Some("serve") {
+fn run(args: impl Iterator<Item = String>) -> Result<()> {
+    let mut args = args.peekable();
+    let serving = args.peek().map(String::as_str) == Some("serve");
+    if serving {
         args.next();
-        let (mut root, mut listen, mut token) = (None, "0.0.0.0:7777".to_string(), String::new());
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--root" => {
-                    root = Some(PathBuf::from(args.next().context("--root needs a directory")?))
-                }
-                "--listen" => listen = args.next().context("--listen needs an address")?,
-                "--token" => token = args.next().context("--token needs a value")?,
-                "-h" | "--help" => usage(),
-                _ => bail!("unknown serve option {arg}"),
-            }
-        }
-        return serve(root.as_deref(), &listen, &token);
     }
-    let mut operands = Vec::new();
-    let mut host = std::env::var("BBRSYNC_HOST").unwrap_or_default();
-    let mut token = std::env::var("BBRSYNC_TOKEN").unwrap_or_default();
+    let (mut source, mut dest, mut root, mut listen) = (None, None, None, None);
+    let mut token = if serving { String::new() } else {
+        std::env::var("BBRSYNC_TOKEN").unwrap_or_default()
+    };
     let mut opts = Opts::default();
     let mut ignore = Vec::new();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--host" | "-H" => host = args.next().context("--host needs an address")?,
-            "--token" => token = args.next().context("--token needs a value")?,
-            "--dry-run" => opts.dry = true,
-            "--full" => opts.full = true,
-            "--delete" => opts.delete = true,
-            "--ignore" | "-i" => ignore.push(args.next().context("--ignore needs a pattern")?),
-            "-h" | "--help" => usage(),
-            a if a.starts_with('-') => bail!("unknown option {a}"),
-            _ => operands.push(arg),
+        let (key, inline) = match arg.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        let mut value = || -> Result<String> {
+            if let Some(value) = inline {
+                return Ok(value.to_owned());
+            }
+            let value = args.next().with_context(|| format!("{key} needs a value"))?;
+            if value.starts_with("--") {
+                bail!("{key} needs a value");
+            }
+            Ok(value)
+        };
+        match (key, serving) {
+            ("--source" | "--dest", false) | ("--root" | "--listen", true) => {
+                let slot = match key {
+                    "--source" => &mut source,
+                    "--dest" => &mut dest,
+                    "--root" => &mut root,
+                    _ => &mut listen,
+                };
+                if slot.is_some() {
+                    bail!("{key} was specified more than once");
+                }
+                let value = value()?;
+                if value.is_empty() { bail!("{key} needs a value"); }
+                *slot = Some(value);
+            }
+            ("--token", _) => token = value()?,
+            ("--ignore" | "-i", false) => ignore.push(value()?),
+            ("--dry-run", false) if inline.is_none() => opts.dry = true,
+            ("--full", false) if inline.is_none() => opts.full = true,
+            ("--delete", false) if inline.is_none() => opts.delete = true,
+            ("--version", _) if inline.is_none() => {
+                println!("bbrsync {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            ("--license", _) if inline.is_none() => {
+                print!("{}", include_str!("../LICENSE"));
+                return Ok(());
+            }
+            ("-h" | "--help", _) if inline.is_none() => {
+                println!(
+                    "usage:\n  \
+                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--token TOKEN]\n  \
+                     bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--token=TOKEN]\n\n\
+                     --source is read from; --dest receives changes. Their order does not matter.\n\
+                     Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
+                     bbrsync --source=website --dest=192.168.1.10:7777/srv/site\n  \
+                     bbrsync --dest=website --source=192.168.1.10:7777/srv/site\n\n\
+                     Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
+                     --dry-run previews without writes. --delete also removes destination-only files.\n\
+                     Existing destination files can be overwritten even without --delete. Keep backups.\n\
+                     Use only on a trusted local network or VPN; traffic is not encrypted.\n\
+                     --version prints the version; --license prints the MIT license."
+                );
+                return Ok(());
+            }
+            _ => bail!("unexpected argument {arg:?}; see --help"),
         }
     }
-    if operands.len() != 2 {
-        bail!("expected a local directory and a daemon-side path");
+    if serving {
+        return serve(root.as_deref().map(Path::new), &listen.context("missing --listen=ADDRESS:PORT")?, &token);
     }
-    if host.is_empty() {
-        bail!("no --host given; refusing to guess");
-    }
-    let (local, remote, pull) = parse_operands(&operands[0], &operands[1])?;
+    let source = source.context("missing --source=PATH")?;
+    let dest = dest.context("missing --dest=PATH")?;
+    let (local, remote, host, pull) = parse_endpoints(&source, &dest)?;
     opts.patterns = load_patterns(Path::new(local), &ignore)?;
-    sync(Path::new(local), remote, &host, &token, pull, &opts)
+    sync(Path::new(local), remote, host, &token, pull, &opts)
+}
+
+fn main() -> Result<()> {
+    run(std::env::args().skip(1))
 }
 
 #[cfg(test)]
