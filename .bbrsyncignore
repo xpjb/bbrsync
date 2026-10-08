@@ -1,0 +1,13 @@
+# Example ignore list. Applied in addition to the always-on defaults
+# (.git, .hg, .svn, .DS_Store, Thumbs.db, *.swp, *~).
+#
+# Syntax, git-style, last matching pattern wins:
+#   name        any path component called `name`
+#   *.ext       any path component matching the glob
+#   /name       only at the root
+#   dir/        directories only
+#   !name       re-include something ignored earlier
+
+target/
+dist/
+node_modules/

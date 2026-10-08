@@ -1,0 +1,24 @@
+[package]
+name = "bbrsync"
+version = "0.1.0"
+edition = "2021"
+description = "Content-defined-chunk file sync over a fat TCP connection"
+license = "MIT"
+
+[[bin]]
+name = "bbrsync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+blake3 = "1"
+fastcdc = "5"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
