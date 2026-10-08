@@ -18,7 +18,6 @@ const MIN_CHUNK: usize = 4096;
 const AVG_CHUNK: usize = 16384;
 const MAX_CHUNK: usize = 65536;
 const TMP_SUFFIX: &str = ".bbrsync-tmp";
-const CACHE_FILE: &str = ".bbrsync-cache";
 const IGNORE: &str = ".bbrsyncignore";
 const DEFAULT_PATTERNS: [&str; 7] =
     [".git", ".hg", ".svn", ".DS_Store", "Thumbs.db", "*.swp", "*~"];
@@ -256,6 +255,39 @@ fn mtime_ns(md: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+fn default_cache_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set; use --cache-dir")?;
+        Ok(PathBuf::from(base).join("bbrsync"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").context("HOME is not set; use --cache-dir")?;
+        Ok(PathBuf::from(home).join("Library/Caches/bbrsync"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CACHE_HOME").filter(|base| !base.is_empty()) {
+            let base = PathBuf::from(base);
+            if base.is_absolute() {
+                return Ok(base.join("bbrsync"));
+            }
+        }
+        let home = std::env::var_os("HOME").context("HOME is not set; use --cache-dir")?;
+        Ok(PathBuf::from(home).join(".cache/bbrsync"))
+    }
+}
+
+fn cache_path(cache_dir: &Path, root: &Path) -> PathBuf {
+    let root = root.components().collect::<PathBuf>();
+    let mut id = blake3::Hasher::new();
+    id.update(b"bbrsync-cache-v1\0");
+    id.update(root.as_os_str().to_string_lossy().as_bytes());
+    cache_dir.join("trees").join(format!("{}.bin", id.finalize().to_hex()))
+}
+
 fn load_cache(path: &Path) -> Cache {
     File::open(path)
         .ok()
@@ -270,14 +302,16 @@ fn load_cache(path: &Path) -> Cache {
         .unwrap_or_default()
 }
 
-fn save_cache(root: &Path, cache: &Cache) -> Result<()> {
-    let mut tmp = temp_file(root)?;
+fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
+    let parent = path.parent().context("cache path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut tmp = temp_file(parent)?;
     let mut writer = BufWriter::new(tmp.as_file_mut());
     bincode::serialize_into(&mut writer, cache)?;
     writer.flush()?;
     drop(writer);
     tmp.as_file().sync_all()?;
-    tmp.persist(root.join(CACHE_FILE))?;
+    tmp.persist(path)?;
     Ok(())
 }
 
@@ -365,7 +399,7 @@ fn load_patterns(src: &Path, extra: &[String]) -> Result<Vec<String>> {
 impl Local {
     /// Missing destinations are empty until commit. Missing/unreadable sources
     /// are errors, never an empty manifest that could authorize deletion.
-    fn scan(root: &Path, opts: &Opts, receiving: bool) -> Result<Self> {
+    fn scan(root: &Path, cache_dir: &Path, opts: &Opts, receiving: bool) -> Result<Self> {
         match fs::metadata(root) {
             Ok(md) if md.is_dir() => {}
             Ok(_) => bail!("{} is not a directory", root.display()),
@@ -374,7 +408,7 @@ impl Local {
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
         }
-        let cache = load_cache(&root.join(CACHE_FILE));
+        let cache = load_cache(&cache_path(cache_dir, root));
         let pats = Patterns::parse(&opts.patterns);
         let mut entries = Cache::new();
         let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -669,18 +703,19 @@ fn transfer(
     w: &mut impl Write,
     r: &mut impl Read,
     root: &Path,
+    cache_dir: &Path,
     sending: bool,
     opts: &Opts,
 ) -> Result<Stats> {
     let result = (|| {
-        let mut local = Local::scan(root, opts, !sending)?;
+        let mut local = Local::scan(root, cache_dir, opts, !sending)?;
         let stats = if sending {
             send_tree(w, r, &local, opts)?
         } else {
             receive_tree(w, r, &mut local, opts)?
         };
         if !opts.dry {
-            if let Err(e) = save_cache(&local.root, &local.entries) {
+            if let Err(e) = save_cache(&cache_path(cache_dir, &local.root), &local.entries) {
                 eprintln!("warning: could not save hash cache: {e:#}");
             }
         }
@@ -709,6 +744,7 @@ fn sync(
     remote: &str,
     host: &str,
     token: &str,
+    cache_dir: &Path,
     pull: bool,
     opts: &Opts,
 ) -> Result<()> {
@@ -745,7 +781,7 @@ fn sync(
         Msg::Ready { version } => bail!("daemon speaks v{version}, this build speaks v{VERSION}"),
         _ => bail!("unexpected reply to hello"),
     }
-    let stats = transfer(&mut w, &mut r, &local, !pull, opts)?;
+    let stats = transfer(&mut w, &mut r, &local, cache_dir, !pull, opts)?;
     if !opts.dry {
         let elapsed = started.elapsed();
         let secs = elapsed.as_secs_f64();
@@ -765,7 +801,7 @@ fn sync(
     Ok(())
 }
 
-fn session(sock: TcpStream, base: Option<&Path>, token: &str) -> Result<()> {
+fn session(sock: TcpStream, base: Option<&Path>, token: &str, cache_dir: &Path) -> Result<()> {
     let mut w = BufWriter::with_capacity(64 << 10, sock.try_clone()?);
     let mut r = BufReader::with_capacity(64 << 10, sock);
     let hello = (|| match recv(&mut r)? {
@@ -788,11 +824,11 @@ fn session(sock: TcpStream, base: Option<&Path>, token: &str) -> Result<()> {
         }
     };
     send(&mut w, &Msg::Ready { version: VERSION })?;
-    transfer(&mut w, &mut r, &root, pull, &opts)?;
+    transfer(&mut w, &mut r, &root, cache_dir, pull, &opts)?;
     Ok(())
 }
 
-fn serve(base: Option<&Path>, listen: &str, token: &str) -> Result<()> {
+fn serve(base: Option<&Path>, listen: &str, token: &str, cache_dir: &Path) -> Result<()> {
     // `--root` is optional: it confines clients to a subtree, but each client
     // still names its own path.
     let base = match base {
@@ -811,7 +847,7 @@ fn serve(base: Option<&Path>, listen: &str, token: &str) -> Result<()> {
         match conn {
             Ok(sock) => {
                 sock.set_nodelay(true).ok();
-                if let Err(e) = session(sock, base.as_deref(), token) {
+                if let Err(e) = session(sock, base.as_deref(), token, cache_dir) {
                     eprintln!("session ended: {e:#}");
                 }
             }
@@ -872,7 +908,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
     if serving {
         args.next();
     }
-    let (mut source, mut dest, mut root, mut listen) = (None, None, None, None);
+    let (mut source, mut dest, mut root, mut listen, mut cache_dir) =
+        (None, None, None, None, None);
     let mut token = if serving { String::new() } else {
         std::env::var("BBRSYNC_TOKEN").unwrap_or_default()
     };
@@ -909,6 +946,16 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                 *slot = Some(value);
             }
             ("--token", _) => token = value()?,
+            ("--cache-dir", _) => {
+                if cache_dir.is_some() {
+                    bail!("--cache-dir was specified more than once");
+                }
+                let value = value()?;
+                if value.is_empty() {
+                    bail!("--cache-dir needs a value");
+                }
+                cache_dir = Some(value);
+            }
             ("--ignore" | "-i", false) => ignore.push(value()?),
             ("--dry-run", false) if inline.is_none() => opts.dry = true,
             ("--full", false) if inline.is_none() => opts.full = true,
@@ -924,14 +971,15 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("-h" | "--help", _) if inline.is_none() => {
                 println!(
                     "usage:\n  \
-                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--token TOKEN]\n  \
-                     bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--token=TOKEN]\n\n\
+                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
+                     bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--cache-dir=DIR] [--token=TOKEN]\n\n\
                      --source is read from; --dest receives changes. Their order does not matter.\n\
                      Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
                      bbrsync --source=website --dest=192.168.1.10:7777/srv/site\n  \
                      bbrsync --dest=website --source=192.168.1.10:7777/srv/site\n\n\
                      Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
                      --dry-run previews without writes. --delete also removes destination-only files.\n\
+                     --cache-dir overrides this process's operating-system cache directory.\n\
                      Existing destination files can be overwritten even without --delete. Keep backups.\n\
                      Use only on a trusted local network or VPN; traffic is not encrypted.\n\
                      --version prints the version; --license prints the MIT license."
@@ -941,14 +989,26 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             _ => bail!("unexpected argument {arg:?}; see --help"),
         }
     }
+    let cache_dir = match cache_dir
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("BBRSYNC_CACHE_DIR").filter(|path| !path.is_empty()).map(PathBuf::from))
+    {
+        Some(path) => std::path::absolute(path)?,
+        None => default_cache_dir()?,
+    };
     if serving {
-        return serve(root.as_deref().map(Path::new), &listen.context("missing --listen=ADDRESS:PORT")?, &token);
+        return serve(
+            root.as_deref().map(Path::new),
+            &listen.context("missing --listen=ADDRESS:PORT")?,
+            &token,
+            &cache_dir,
+        );
     }
     let source = source.context("missing --source=PATH")?;
     let dest = dest.context("missing --dest=PATH")?;
     let (local, remote, host, pull) = parse_endpoints(&source, &dest)?;
     opts.patterns = load_patterns(Path::new(local), &ignore)?;
-    sync(Path::new(local), remote, host, &token, pull, &opts)
+    sync(Path::new(local), remote, host, &token, &cache_dir, pull, &opts)
 }
 
 fn main() -> Result<()> {

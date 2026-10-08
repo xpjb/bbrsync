@@ -8,6 +8,7 @@ struct Tree {
     base: PathBuf,
     local: PathBuf,
     remote: PathBuf,
+    cache: PathBuf,
 }
 
 impl Tree {
@@ -16,9 +17,10 @@ impl Tree {
         let base = scratch.path().canonicalize().unwrap();
         let local = base.join("local");
         let remote = base.join("remote");
+        let cache = base.join("cache");
         fs::create_dir(&local).unwrap();
         fs::create_dir(&remote).unwrap();
-        Self { _scratch: scratch, base, local, remote }
+        Self { _scratch: scratch, base, local, remote, cache }
     }
 
     fn ends(&self, pull: bool) -> (&Path, &Path) {
@@ -30,18 +32,29 @@ impl Tree {
     }
 
     fn run(&self, pull: bool, opts: &Opts) -> Result<()> {
-        self.with_peer(|host| sync(&self.local, self.remote.to_str().unwrap(), host, "", pull, opts))
+        self.with_peer(|host| {
+            sync(
+                &self.local,
+                self.remote.to_str().unwrap(),
+                host,
+                "",
+                &self.cache,
+                pull,
+                opts,
+            )
+        })
     }
 
     fn with_peer(&self, client: impl FnOnce(&str) -> Result<()>) -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let host = listener.local_addr()?.to_string();
         let base = self.base.clone();
+        let cache = self.cache.clone();
         let daemon = std::thread::spawn(move || {
             let (sock, _) = listener.accept()?;
             sock.set_read_timeout(Some(Duration::from_secs(5)))?;
             sock.set_write_timeout(Some(Duration::from_secs(5)))?;
-            session(sock, Some(&base), "")
+            session(sock, Some(&base), "", &cache)
         });
         let result = client(&host);
         let server = daemon.join().expect("test daemon panicked");
@@ -119,13 +132,45 @@ fn dry_run_does_not_modify_either_tree() {
         put(dst, "keep", b"old");
         put(dst, "local-only", b"precious");
         put(dst, "old.bbrsync-tmp", b"not ours to remove");
-        put(dst, CACHE_FILE, b"a cache must not be rewritten by dry-run");
+        let src_cache = cache_path(&tree.cache, src);
+        let dst_cache = cache_path(&tree.cache, dst);
+        for path in [&src_cache, &dst_cache] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"a cache must not be rewritten by dry-run").unwrap();
+        }
         let before_src = snapshot(src);
         let before_dst = snapshot(dst);
         tree.run(pull, &Opts { dry: true, delete: true, ..options() }).unwrap();
         assert_eq!(snapshot(src), before_src);
         assert_eq!(snapshot(dst), before_dst);
+        assert_eq!(fs::read(src_cache).unwrap(), b"a cache must not be rewritten by dry-run");
+        assert_eq!(fs::read(dst_cache).unwrap(), b"a cache must not be rewritten by dry-run");
     }
+}
+
+#[test]
+fn caches_are_keyed_by_root_and_stay_outside_synced_trees() {
+    let tree = Tree::new();
+    put(&tree.local, "file", b"data");
+    tree.run(false, &options()).unwrap();
+    let local_cache = cache_path(&tree.cache, &tree.local);
+    let remote_cache = cache_path(&tree.cache, &tree.remote);
+    assert_ne!(local_cache, remote_cache);
+    assert!(local_cache.is_file());
+    let files = fs::read_dir(tree.cache.join("trees"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(remote_cache.is_file(), "wanted {}; found {files:?}", remote_cache.display());
+    assert!(!tree.local.join(".bbrsync-cache").exists());
+    assert!(!tree.remote.join(".bbrsync-cache").exists());
+}
+
+#[test]
+fn default_cache_directory_is_absolute_and_owned_by_bbrsync() {
+    let cache = default_cache_dir().unwrap();
+    assert!(cache.is_absolute());
+    assert_eq!(cache.file_name().unwrap(), "bbrsync");
 }
 
 #[test]
@@ -227,8 +272,8 @@ fn files_composed_only_of_reused_chunks_are_still_rebuilt() {
         let (_, chunks) = describe(&dst.join("file")).unwrap();
         let new = &old[..chunks[0].len as usize];
         put(src, "file", new);
-        let source = Local::scan(src, &options(), false).unwrap();
-        let target = Local::scan(dst, &options(), true).unwrap();
+        let source = Local::scan(src, &tree.cache, &options(), false).unwrap();
+        let target = Local::scan(dst, &tree.cache, &options(), true).unwrap();
         let entry = &source.entries["file"];
         let held = chunk_index(target.entries.get("file"));
         assert_ne!(entry.content, target.entries["file"].content);
@@ -276,12 +321,12 @@ fn full_rehashes_both_peers() {
             put(src, "file", b"source");
             put(dst, "file", b"target");
             let (bad, other) = if poison_source { (src, dst) } else { (dst, src) };
-            let mut cache = Local::scan(bad, &options(), false).unwrap().entries;
+            let mut cache = Local::scan(bad, &tree.cache, &options(), false).unwrap().entries;
             let (content, chunks) = describe(&other.join("file")).unwrap();
             let entry = cache.get_mut("file").unwrap();
             entry.content = content;
             entry.chunks = chunks;
-            save_cache(bad, &cache).unwrap();
+            save_cache(&cache_path(&tree.cache, bad), &cache).unwrap();
             tree.run(pull, &Opts { full: true, ..options() }).unwrap();
             assert_eq!(fs::read(dst.join("file")).unwrap(), b"source");
         }
@@ -299,7 +344,15 @@ fn receiver_rejects_unrequested_deletion_before_writing() {
         deletes: vec!["extra".into()],
         total: 1,
     })]);
-    let err = transfer(&mut Vec::new(), &mut input, &tree.local, false, &options()).unwrap_err();
+    let err = transfer(
+        &mut Vec::new(),
+        &mut input,
+        &tree.local,
+        &tree.cache,
+        false,
+        &options(),
+    )
+    .unwrap_err();
     assert!(format!("{err:#}").contains("without --delete"));
     assert_eq!(snapshot(&tree.local), before);
 }
@@ -310,9 +363,9 @@ fn receiver_rejects_unscanned_or_duplicate_delete_paths() {
     for i in 0..6 {
         put(&tree.local, &format!("file-{i}"), b"keep");
     }
-    let local = Local::scan(&tree.local, &options(), true).unwrap();
+    let local = Local::scan(&tree.local, &tree.cache, &options(), true).unwrap();
     for paths in
-        [vec![".git/config"], vec!["file-0", "file-0"], vec!["../outside"], vec![CACHE_FILE]]
+        [vec![".git/config"], vec!["file-0", "file-0"], vec!["../outside"], vec![".bbrsync-cache"]]
     {
         let plan = Plan {
             refs: vec![],
@@ -351,6 +404,7 @@ fn failed_transfer_does_not_publish_or_delete() {
             &mut Vec::new(),
             &mut input,
             &tree.local,
+            &tree.cache,
             false,
             &Opts { delete: true, ..options() }
         )
@@ -368,8 +422,8 @@ fn source_scan_error_cannot_turn_into_deletion() {
         put(dst, "keep", b"precious");
         // A non-directory source is an error, never an empty manifest.
         let before = snapshot(dst);
-        assert!(Local::scan(&src.join("file"), &options(), false).is_err());
-        assert!(Local::scan(&src.join("missing"), &options(), false).is_err());
+        assert!(Local::scan(&src.join("file"), &tree.cache, &options(), false).is_err());
+        assert!(Local::scan(&src.join("missing"), &tree.cache, &options(), false).is_err());
         assert_eq!(snapshot(dst), before);
     }
 }
@@ -455,7 +509,11 @@ fn named_flags_transfer_in_both_directions_regardless_of_order_or_equals_style()
                     let (source, dest) = if pull { (remote, local) } else { (local, remote) };
                     let mut endpoints = [("--source", source), ("--dest", dest)];
                     if reversed { endpoints.reverse(); }
-                    let mut args = vec!["--token=".to_owned(), "--ignore=ignored".to_owned()];
+                    let mut args = vec![
+                        "--token=".to_owned(),
+                        "--ignore=ignored".to_owned(),
+                        format!("--cache-dir={}", tree.cache.display()),
+                    ];
                     if delete { args.push("--delete".into()); }
                     for (key, value) in endpoints {
                         if equals { args.push(format!("{key}={value}")); }
@@ -487,7 +545,15 @@ fn named_cli_dry_run_with_delete_does_not_modify_either_tree() {
             let path = tree.remote.to_str().unwrap();
             let remote = format!("{host}/{}", path.strip_prefix('/').unwrap_or(path));
             let (source, dest) = if pull { (remote, local) } else { (local, remote) };
-            super::run([format!("--dest={dest}"), format!("--source={source}"), "--dry-run".into(), "--delete".into(), "--full".into(), "--token=".into()].into_iter())
+            super::run([
+                format!("--dest={dest}"),
+                format!("--source={source}"),
+                format!("--cache-dir={}", tree.cache.display()),
+                "--dry-run".into(),
+                "--delete".into(),
+                "--full".into(),
+                "--token=".into(),
+            ].into_iter())
         }).unwrap();
         assert_eq!(snapshot(&tree.local), before_local);
         assert_eq!(snapshot(&tree.remote), before_remote);
@@ -507,7 +573,7 @@ fn destination_symlinks_do_not_overwrite_outside_the_tree() {
         put(src, "link/file", b"must not overwrite");
         assert!(tree.run(pull, &options()).is_err());
         assert_eq!(fs::read(outside.join("file")).unwrap(), b"precious");
-        assert!(!dst.join(CACHE_FILE).exists());
+        assert!(!cache_path(&tree.cache, dst).exists());
     }
 }
 
@@ -544,15 +610,16 @@ fn existing_permissions_survive_content_updates() {
 
 #[cfg(unix)]
 #[test]
-fn cache_temp_symlink_is_not_followed_or_removed() {
+fn cache_path_symlink_is_not_followed() {
     use std::os::unix::fs::symlink;
     let tree = Tree::new();
     put(&tree.base, "outside", b"precious");
-    symlink(tree.base.join("outside"), tree.local.join(format!("{CACHE_FILE}.new"))).unwrap();
+    let cache = cache_path(&tree.cache, &tree.local);
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    symlink(tree.base.join("outside"), &cache).unwrap();
     put(&tree.local, "file", b"data");
     tree.run(false, &options()).unwrap();
     assert_eq!(fs::read(tree.base.join("outside")).unwrap(), b"precious");
-    assert!(tree.local.join(format!("{CACHE_FILE}.new")).is_symlink());
 }
 
 #[test]
@@ -565,8 +632,8 @@ fn mixed_reused_and_received_chunks_follow_manifest_order() {
         new[MAX_CHUNK + 123] ^= 0xff;
         put(src, "file", &new);
         put(dst, "file", &old);
-        let source = Local::scan(src, &options(), false).unwrap();
-        let target = Local::scan(dst, &options(), true).unwrap();
+        let source = Local::scan(src, &tree.cache, &options(), false).unwrap();
+        let target = Local::scan(dst, &tree.cache, &options(), true).unwrap();
         let held = chunk_index(target.entries.get("file"));
         let chunks = &source.entries["file"].chunks;
         assert!(chunks.iter().any(|c| held.contains_key(&c.hash)));
@@ -596,6 +663,7 @@ fn wrong_chunk_order_or_extra_chunks_cannot_publish_or_delete() {
             &mut Vec::new(),
             &mut input,
             &tree.local,
+            &tree.cache,
             false,
             &Opts { delete: true, ..options() }
         )

@@ -74,6 +74,8 @@ not on a dry run. `BBRSYNC_TOKEN` supplies the client's optional token default.
 - **`--dry-run`:** report the plan without creating, overwriting, deleting, or
   updating caches on either side.
 - **`--full`:** bypass hash caches and re-read file contents.
+- **`--cache-dir DIR`:** override this process's operating-system cache directory.
+  The client and daemon configure their caches independently.
 - **`-i/--ignore PATTERN`:** add an ignore rule, applied to both sides.
 
 ## Deletion safety
@@ -100,7 +102,7 @@ harmless, especially when files are overwritten.
 Rules come from the **client's local directory** `.bbrsyncignore`, then command
 line `-i` rules. The resulting rules apply to both endpoints, including pulls.
 Default exclusions are `.git`, `.hg`, `.svn`, `.DS_Store`, `Thumbs.db`, `*.swp`
-and `*~`. bbrsync's own cache, ignore and temporary files are always excluded.
+and `*~`. bbrsync's own ignore and temporary files are always excluded.
 
 ```text
 node_modules/     # directories of this name
@@ -117,9 +119,15 @@ Dotfiles such as `.env` are ordinary content unless explicitly ignored.
 
 FastCDC uses 4 / 16 / 64 KiB minimum/average/maximum chunks and BLAKE3 hashes. File
 bytes are streamed; manifests and chunk indexes occupy memory proportional to
-the tree. A `.bbrsync-cache` keyed by size and modification time avoids rehashing
+the tree. Per-root caches keyed by size and modification time avoid rehashing
 unchanged files. Changes preserving both values require `--full`. Corrupt caches
 are discarded and rebuilt.
+
+Caches live outside synchronized trees. The defaults are
+`$XDG_CACHE_HOME/bbrsync` or `~/.cache/bbrsync` on Linux,
+`~/Library/Caches/bbrsync` on macOS, and `%LOCALAPPDATA%\bbrsync` on Windows.
+`BBRSYNC_CACHE_DIR` and `--cache-dir` override the default for the current
+process. Cache filenames are derived from normalized absolute root paths.
 
 Changed files are assembled in temporary files, verified, synced, then published
 by rename. Existing destination permissions are preserved. Publication is atomic
