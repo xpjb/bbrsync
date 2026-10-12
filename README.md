@@ -77,13 +77,12 @@ not on a dry run. `BBRSYNC_TOKEN` supplies the client's optional token default.
 - **`--full`:** bypass hash caches and re-read file contents.
 - **`--cache-dir DIR`:** override this process's operating-system cache directory.
   The client and daemon configure their caches independently.
-- **`--progress MODE`:** `auto` updates one line when standard error is a terminal,
-  `always` also emits periodic line-oriented updates when redirected, and `never`
-  disables progress. The default is `auto`. Progress uses standard error; existing
-  standard output and exit behavior stay unchanged. Totals count bytes requested
-  across the network, excluding chunks reused at the destination. Dry runs do not
-  show progress.
 - **`-i/--ignore PATTERN`:** add an ignore rule, applied to both sides.
+
+Interactive real transfers automatically show per-file progress on standard error.
+Redirected and scripted runs stay quiet, and dry runs do not show progress. Totals
+count bytes requested across the network, excluding chunks reused at the destination.
+Existing standard output and exit behavior stay unchanged.
 
 ## Deletion safety
 

@@ -109,23 +109,9 @@ struct Patterns {
     lines: Vec<Pat>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProgressMode {
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProgressOutput {
-    Off,
-    Rewrite,
-    Lines,
-}
-
 struct Progress<'a> {
     out: &'a mut dyn Write,
-    output: ProgressOutput,
+    visible: bool,
     active: bool,
     shown: bool,
     index: usize,
@@ -140,15 +126,10 @@ struct Progress<'a> {
 }
 
 impl<'a> Progress<'a> {
-    fn new(mode: ProgressMode, terminal: bool, out: &'a mut dyn Write) -> Self {
-        let output = match (mode, terminal) {
-            (ProgressMode::Never, _) | (ProgressMode::Auto, false) => ProgressOutput::Off,
-            (ProgressMode::Auto | ProgressMode::Always, true) => ProgressOutput::Rewrite,
-            (ProgressMode::Always, false) => ProgressOutput::Lines,
-        };
+    fn new(visible: bool, out: &'a mut dyn Write) -> Self {
         Self {
             out,
-            output,
+            visible,
             active: false,
             shown: false,
             index: 0,
@@ -164,7 +145,7 @@ impl<'a> Progress<'a> {
     }
 
     fn status(&mut self, text: &str) {
-        if self.output == ProgressOutput::Off {
+        if !self.visible {
             return;
         }
         self.active = false;
@@ -174,7 +155,7 @@ impl<'a> Progress<'a> {
 
     fn begin_file(&mut self, index: usize, count: usize, path: &str, total: u64) {
         self.clear_line();
-        self.active = self.output != ProgressOutput::Off && total > 0;
+        self.active = self.visible && total > 0;
         self.shown = false;
         self.index = index;
         self.count = count;
@@ -197,14 +178,11 @@ impl<'a> Progress<'a> {
         }
         self.done = self.done.saturating_add(bytes).min(self.total);
         let now = std::time::Instant::now();
-        let interval = if self.output == ProgressOutput::Lines {
-            std::time::Duration::from_secs(1)
-        } else {
-            std::time::Duration::from_millis(200)
-        };
         if self.done < self.total
             && now.duration_since(self.started) >= std::time::Duration::from_millis(250)
-            && self.last_draw.map_or(true, |last| now.duration_since(last) >= interval)
+            && self.last_draw.map_or(true, |last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(200)
+            })
         {
             self.render(now, false);
         }
@@ -249,7 +227,7 @@ impl<'a> Progress<'a> {
     }
 
     fn clear_line(&mut self) {
-        if self.output == ProgressOutput::Rewrite && self.line_visible {
+        if self.visible && self.line_visible {
             let _ = write!(self.out, "\r{:width$}\r", "", width = self.line_width);
             let _ = self.out.flush();
         }
@@ -258,33 +236,27 @@ impl<'a> Progress<'a> {
     }
 
     fn write_line(&mut self, line: &str, complete: bool) {
-        match self.output {
-            ProgressOutput::Off => {}
-            ProgressOutput::Rewrite => {
-                let width = line.chars().count();
-                let padding = self.line_width.saturating_sub(width);
-                let _ = write!(self.out, "\r{line}{:padding$}", "");
-                if complete {
-                    let _ = writeln!(self.out);
-                    self.line_width = 0;
-                    self.line_visible = false;
-                } else {
-                    self.line_width = width;
-                    self.line_visible = true;
-                }
-                let _ = self.out.flush();
-            }
-            ProgressOutput::Lines => {
-                let _ = writeln!(self.out, "{line}");
-                let _ = self.out.flush();
-            }
+        if !self.visible {
+            return;
         }
+        let width = line.chars().count();
+        let padding = self.line_width.saturating_sub(width);
+        let _ = write!(self.out, "\r{line}{:padding$}", "");
+        if complete {
+            let _ = writeln!(self.out);
+            self.line_width = 0;
+            self.line_visible = false;
+        } else {
+            self.line_width = width;
+            self.line_visible = true;
+        }
+        let _ = self.out.flush();
     }
 }
 
 impl Drop for Progress<'_> {
     fn drop(&mut self) {
-        if self.output == ProgressOutput::Rewrite && self.line_visible {
+        if self.visible && self.line_visible {
             let _ = writeln!(self.out);
             let _ = self.out.flush();
         }
@@ -969,7 +941,6 @@ fn sync(
     cache_dir: &Path,
     pull: bool,
     opts: &Opts,
-    progress_mode: ProgressMode,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let local = if pull {
@@ -1005,10 +976,9 @@ fn sync(
         _ => bail!("unexpected reply to hello"),
     }
     let stderr = std::io::stderr();
-    let terminal = stderr.is_terminal();
+    let visible = stderr.is_terminal() && !opts.dry;
     let mut stderr = stderr.lock();
-    let mode = if opts.dry { ProgressMode::Never } else { progress_mode };
-    let mut progress = Progress::new(mode, terminal, &mut stderr);
+    let mut progress = Progress::new(visible, &mut stderr);
     let stats = transfer(&mut w, &mut r, &local, cache_dir, !pull, opts, &mut progress)?;
     if !opts.dry {
         let elapsed = started.elapsed();
@@ -1053,7 +1023,7 @@ fn session(sock: TcpStream, base: Option<&Path>, token: &str, cache_dir: &Path) 
     };
     send(&mut w, &Msg::Ready { version: VERSION })?;
     let mut sink = std::io::sink();
-    let mut progress = Progress::new(ProgressMode::Never, false, &mut sink);
+    let mut progress = Progress::new(false, &mut sink);
     transfer(&mut w, &mut r, &root, cache_dir, pull, &opts, &mut progress)?;
     Ok(())
 }
@@ -1140,7 +1110,6 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
     }
     let (mut source, mut dest, mut root, mut listen, mut cache_dir) =
         (None, None, None, None, None);
-    let mut progress_mode = None;
     let mut token = if serving { String::new() } else {
         std::env::var("BBRSYNC_TOKEN").unwrap_or_default()
     };
@@ -1188,17 +1157,6 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                 cache_dir = Some(value);
             }
             ("--ignore" | "-i", false) => ignore.push(value()?),
-            ("--progress", false) => {
-                if progress_mode.is_some() {
-                    bail!("--progress was specified more than once");
-                }
-                progress_mode = Some(match value()?.as_str() {
-                    "auto" => ProgressMode::Auto,
-                    "always" => ProgressMode::Always,
-                    "never" => ProgressMode::Never,
-                    mode => bail!("invalid --progress mode {mode:?}; use auto, always, or never"),
-                });
-            }
             ("--dry-run", false) if inline.is_none() => opts.dry = true,
             ("--full", false) if inline.is_none() => opts.full = true,
             ("--delete", false) if inline.is_none() => opts.delete = true,
@@ -1213,7 +1171,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("-h" | "--help", _) if inline.is_none() => {
                 println!(
                     "usage:\n  \
-                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN] [--progress MODE]\n  \
+                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
                      bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--cache-dir=DIR] [--token=TOKEN]\n\n\
                      --source is read from; --dest receives changes. Their order does not matter.\n\
                      Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
@@ -1222,7 +1180,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                      Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
                      --dry-run previews without writes. --delete also removes destination-only files.\n\
                      --cache-dir overrides this process's operating-system cache directory.\n\
-                     --progress is auto (terminal only), always, or never; progress uses standard error.\n\
+                     Interactive transfers show progress on standard error; redirected runs stay quiet.\n\
                      Existing destination files can be overwritten even without --delete. Keep backups.\n\
                      Use only on a trusted local network or VPN; traffic is not encrypted.\n\
                      --version prints the version; --license prints the MIT license."
@@ -1259,7 +1217,6 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
         &cache_dir,
         pull,
         &opts,
-        progress_mode.unwrap_or(ProgressMode::Auto),
     )
 }
 

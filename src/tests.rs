@@ -41,7 +41,6 @@ impl Tree {
                 &self.cache,
                 pull,
                 opts,
-                ProgressMode::Never,
             )
         })
     }
@@ -346,7 +345,7 @@ fn receiver_rejects_unrequested_deletion_before_writing() {
         total: 1,
     })]);
     let mut sink = std::io::sink();
-    let mut progress = Progress::new(ProgressMode::Never, false, &mut sink);
+    let mut progress = Progress::new(false, &mut sink);
     let err = transfer(
         &mut Vec::new(),
         &mut input,
@@ -405,7 +404,7 @@ fn failed_transfer_does_not_publish_or_delete() {
         } // Otherwise the stream ends halfway through the transfer.
         let mut input = wire(messages);
         let mut sink = std::io::sink();
-        let mut progress = Progress::new(ProgressMode::Never, false, &mut sink);
+        let mut progress = Progress::new(false, &mut sink);
         assert!(transfer(
             &mut Vec::new(),
             &mut input,
@@ -485,10 +484,6 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
         (vec!["--dest=host:bad/dest", "--source=local", "--dest=host:bad/other"], "--dest was specified more than once"),
         (vec!["local", ":/remote", "--host=host:bad"], "unexpected argument"),
         (vec!["--source=local", "--dest=host:bad/dest", "--delete=false"], "unexpected argument"),
-        (vec!["--source=local", "--dest=host:7777/dest", "--progress"], "--progress needs a value"),
-        (vec!["--source=local", "--dest=host:7777/dest", "--progress=fast"], "invalid --progress mode"),
-        (vec!["--source=local", "--dest=host:7777/dest", "--progress=auto", "--progress=never"], "--progress was specified more than once"),
-        (vec!["serve", "--listen=127.0.0.1:7777", "--progress=never"], "unexpected argument"),
         (vec!["serve"], "missing --listen"),
         (vec!["serve", "--listen=host:bad", "--listen=other:bad"], "--listen was specified more than once"),
     ] {
@@ -498,32 +493,32 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
 }
 
 #[test]
-fn redirected_progress_is_quiet_by_default_and_line_oriented_when_forced() {
-    let mut automatic = Vec::new();
+fn progress_is_quiet_when_redirected_and_rewrites_an_interactive_line() {
+    let mut redirected = Vec::new();
     {
-        let mut progress = Progress::new(ProgressMode::Auto, false, &mut automatic);
+        let mut progress = Progress::new(false, &mut redirected);
         progress.status("scanning local files...");
         progress.begin_file(1, 2, "large file.bin", 100);
         progress.started = std::time::Instant::now() - Duration::from_secs(1);
         progress.advance(50);
         progress.finish_file();
     }
-    assert!(automatic.is_empty());
+    assert!(redirected.is_empty());
 
-    let mut forced = Vec::new();
+    let mut interactive = Vec::new();
     {
-        let mut progress = Progress::new(ProgressMode::Always, false, &mut forced);
+        let mut progress = Progress::new(true, &mut interactive);
         progress.status("scanning local files...");
         progress.begin_file(1, 2, "large file.bin", 100);
         progress.started = std::time::Instant::now() - Duration::from_secs(1);
         progress.advance(50);
         progress.finish_file();
     }
-    let forced = String::from_utf8(forced).unwrap();
-    assert!(forced.contains("scanning local files..."));
-    assert!(forced.contains("[1/2] large file.bin   50%"));
-    assert!(forced.contains("[1/2] large file.bin  100%"));
-    assert!(!forced.contains('\r'));
+    let interactive = String::from_utf8(interactive).unwrap();
+    assert!(interactive.contains("scanning local files..."));
+    assert!(interactive.contains("[1/2] large file.bin   50%"));
+    assert!(interactive.contains("[1/2] large file.bin  100%"));
+    assert!(interactive.contains('\r'));
 }
 
 #[test]
@@ -704,7 +699,7 @@ fn wrong_chunk_order_or_extra_chunks_cannot_publish_or_delete() {
         messages.push(Msg::Done);
         let mut input = wire(messages);
         let mut sink = std::io::sink();
-        let mut progress = Progress::new(ProgressMode::Never, false, &mut sink);
+        let mut progress = Progress::new(false, &mut sink);
         assert!(transfer(
             &mut Vec::new(),
             &mut input,
