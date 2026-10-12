@@ -181,7 +181,8 @@ impl<'a> Progress<'a> {
         self.path = if path.chars().count() <= 48 {
             path.to_owned()
         } else {
-            let tail: String = path.chars().rev().take(47).collect::<String>().chars().rev().collect();
+            let tail: String =
+                path.chars().rev().take(47).collect::<String>().chars().rev().collect();
             format!("…{tail}")
         };
         self.done = 0;
@@ -203,7 +204,7 @@ impl<'a> Progress<'a> {
         };
         if self.done < self.total
             && now.duration_since(self.started) >= std::time::Duration::from_millis(250)
-            && self.last_draw.is_none_or(|last| now.duration_since(last) >= interval)
+            && self.last_draw.map_or(true, |last| now.duration_since(last) >= interval)
         {
             self.render(now, false);
         }
