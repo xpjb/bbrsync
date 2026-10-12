@@ -172,7 +172,7 @@ fn resolve_target(base: Option<&Path>, dest: &str) -> Result<PathBuf> {
     }
     #[cfg(unix)]
     for forbidden in
-        ["/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/sbin", "/sys", "/usr"]
+        ["/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/sbin", "/sys", "/usr"]
     {
         if resolved.starts_with(forbidden) {
             bail!("refusing to use {forbidden} as a destination");
@@ -975,8 +975,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                      bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--cache-dir=DIR] [--token=TOKEN]\n\n\
                      --source is read from; --dest receives changes. Their order does not matter.\n\
                      Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
-                     bbrsync --source=website --dest=192.168.1.10:7777/srv/site\n  \
-                     bbrsync --dest=website --source=192.168.1.10:7777/srv/site\n\n\
+                     bbrsync --source=website --dest=vibe:7777/srv/site\n  \
+                     bbrsync --dest=website --source=vibe:7777/srv/site\n\n\
                      Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
                      --dry-run previews without writes. --delete also removes destination-only files.\n\
                      --cache-dir overrides this process's operating-system cache directory.\n\

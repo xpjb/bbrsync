@@ -38,25 +38,26 @@ optional `--token=SECRET` must match the client's token.
 
 **`--source` is read from. `--dest` receives the changes.** Their order does not
 matter. Exactly one endpoint must be remote, written as `HOST:PORT/PATH`. The
-other is a local directory. The contents of the source go directly into the
-destination; the source directory's name is not appended.
+host may be an IP address or a resolvable DNS or Tailscale hostname, such as
+`vibe:7777`. The other endpoint is a local directory. The contents of the source
+go directly into the destination; the source directory's name is not appended.
 
 ```sh
 # Send the local website directory to the daemon.
-bbrsync --source=website --dest=192.168.1.10:7777/srv/site
+bbrsync --source=website --dest=vibe:7777/srv/site
 
 # Copy it from the daemon into the local website directory.
-bbrsync --dest=website --source=192.168.1.10:7777/srv/site
+bbrsync --dest=website --source=vibe:7777/srv/site
 
 # Preview before writing anything.
-bbrsync --source=website --dest=192.168.1.10:7777/srv/site --dry-run
+bbrsync --source=website --dest=vibe:7777/srv/site --dry-run
 ```
 
 Absolute Windows drive paths are local paths. Quote arguments containing spaces:
 
 ```powershell
-.\bbrsync.exe --source="C:\My Sites\website" --dest=192.168.1.10:7777/srv/site
-.\bbrsync.exe --dest="C:\My Sites\website" --source=192.168.1.10:7777/srv/site
+.\bbrsync.exe --source="C:\My Sites\website" --dest=vibe:7777/srv/site
+.\bbrsync.exe --dest="C:\My Sites\website" --source=vibe:7777/srv/site
 ```
 
 For a daemon running on Windows, a remote endpoint can be
@@ -89,8 +90,8 @@ Before changing files, the receiver checks the transfer plan:
   files have been verified and published. Scan/transfer errors do not authorize
   deletion; deletion failures are reported.
 - Reject traversal and existing symlink/junction components in file paths.
-  Resolved roots are checked against `--root`; filesystem roots and Unix system
-  trees such as `/etc`, `/usr`, and `/root` are refused as destinations.
+  Resolved roots are checked against `--root`; the filesystem root and Unix
+  system trees such as `/etc` and `/usr` are refused as destinations.
 
 Unrelated empty directories and old temporary files are left alone. These checks
 protect against some mistakes, not every failure or a hostile local process

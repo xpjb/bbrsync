@@ -589,6 +589,10 @@ fn confinement_checks_resolved_roots_and_relative_destinations() {
     assert!(resolve_target(Some(Path::new("/")), ".").is_err());
     assert!(resolve_target(Some(Path::new("/")), "etc").is_err());
     assert!(resolve_target(None, "/").is_err());
+    assert_eq!(
+        resolve_target(None, "/root/bbrsync-root-allowed").unwrap(),
+        Path::new("/root/bbrsync-root-allowed")
+    );
 }
 
 #[cfg(unix)]
