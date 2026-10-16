@@ -5,19 +5,21 @@
 use anyhow::{bail, Context, Result};
 use bincode::Options as _;
 use fastcdc::v2020::StreamCDC;
+use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MIN_CHUNK: usize = 4096;
 const AVG_CHUNK: usize = 16384;
 const MAX_CHUNK: usize = 65536;
 const TMP_SUFFIX: &str = ".bbrsync-tmp";
+const PARTIAL_DIR: &str = ".bbrsync-partials";
 const IGNORE: &str = ".bbrsyncignore";
 const DEFAULT_PATTERNS: [&str; 7] =
     [".git", ".hg", ".svn", ".DS_Store", "Thumbs.db", "*.swp", "*~"];
@@ -62,6 +64,12 @@ struct Local {
     entries: Cache,
 }
 
+struct Partial {
+    slots: [PathBuf; 2],
+    input: Option<(PathBuf, Vec<ChunkRef>)>,
+    output: PathBuf,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Opts {
     delete: bool,
@@ -92,7 +100,7 @@ enum Msg {
     Files(Manifest),
     Diffs(Plan),
     Needs(Vec<FileNeed>),
-    Chunk(Vec<u8>),
+    Chunk { compressed: bool, data: Vec<u8> },
     Done,
     Ok(Stats),
     Error(String),
@@ -383,6 +391,16 @@ fn temp_file(parent: &Path) -> Result<tempfile::NamedTempFile> {
     Ok(tempfile::Builder::new().prefix(".bbrsync-").suffix(TMP_SUFFIX).tempfile_in(parent)?)
 }
 
+fn partial_paths(root: &Path, rel: &str, content: &Hash) -> [PathBuf; 2] {
+    let mut key = blake3::Hasher::new();
+    key.update(b"bbrsync-partial-v1\0");
+    key.update(rel.as_bytes());
+    key.update(content);
+    let key = key.finalize().to_hex();
+    let dir = root.join(PARTIAL_DIR);
+    [dir.join(format!("{key}.0")), dir.join(format!("{key}.1"))]
+}
+
 // ------------------------------------------- hashing, caching and scanning
 
 fn hash_of(b: &[u8]) -> Hash {
@@ -638,10 +656,15 @@ impl Plan {
 
 // --------------------------------------------------------- framed messages
 
-fn send(w: &mut impl Write, msg: &Msg) -> Result<()> {
+fn write_msg(w: &mut impl Write, msg: &Msg) -> Result<()> {
     let body = bincode::serialize(msg)?;
     w.write_all(&u32::try_from(body.len())?.to_le_bytes())?;
     w.write_all(&body)?;
+    Ok(())
+}
+
+fn send(w: &mut impl Write, msg: &Msg) -> Result<()> {
+    write_msg(w, msg)?;
     w.flush()?;
     Ok(())
 }
@@ -667,8 +690,12 @@ fn send_error(w: &mut impl Write, msg: impl std::fmt::Display) {
 
 // ---------------------------------------------- shared sender and receiver
 
+fn chunks_index(chunks: &[ChunkRef]) -> HashMap<Hash, (u64, u64)> {
+    chunks.iter().map(|chunk| (chunk.hash, (chunk.start, chunk.len))).collect()
+}
+
 fn chunk_index(entry: Option<&Entry>) -> HashMap<Hash, (u64, u64)> {
-    entry.into_iter().flat_map(|e| &e.chunks).map(|c| (c.hash, (c.start, c.len))).collect()
+    entry.map_or_else(HashMap::new, |entry| chunks_index(&entry.chunks))
 }
 
 fn send_chunks(
@@ -700,7 +727,14 @@ fn send_chunks(
                 f.seek(SeekFrom::Start(chunk.start))?;
                 let mut data = vec![0u8; chunk.len as usize];
                 f.read_exact(&mut data)?;
-                send(w, &Msg::Chunk(data))?;
+                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+                encoder.write_all(&data)?;
+                let packed = encoder.finish()?;
+                if packed.len() < data.len() {
+                    write_msg(w, &Msg::Chunk { compressed: true, data: packed })?;
+                } else {
+                    write_msg(w, &Msg::Chunk { compressed: false, data })?;
+                }
                 progress.advance(chunk.len);
             }
         }
@@ -715,54 +749,80 @@ fn assemble(
     root: &Path,
     refs: &[FileRef],
     have: &Cache,
+    partials: &HashMap<String, Partial>,
     stream: &mut impl Read,
     progress: &mut Progress<'_>,
 ) -> Result<(u64, u64, Vec<(String, Entry)>)> {
     let mut staged = Vec::new();
     let (mut received, mut written) = (0, 0);
     for (index, f) in refs.iter().enumerate() {
+        let partial = partials.get(&f.path).context("missing partial transfer state")?;
         let local_at = chunk_index(have.get(&f.path));
+        let partial_at = partial
+            .input
+            .as_ref()
+            .map_or_else(HashMap::new, |(_, chunks)| chunks_index(chunks));
         let total = f
             .chunks
             .iter()
-            .filter(|chunk| !local_at.contains_key(&chunk.hash))
+            .filter(|chunk| !local_at.contains_key(&chunk.hash) && !partial_at.contains_key(&chunk.hash))
             .map(|chunk| chunk.len)
             .sum();
         progress.begin_file(index + 1, refs.len(), &f.path, total);
         let dest = safe_join(root, &f.path)?;
         make_dirs(root, &dest)?;
-        let mut tmp = temp_file(dest.parent().context("missing file parent")?)?;
-        // Updating content must not make a private file public or remove +x.
+        let mut tmp = OpenOptions::new().create(true).truncate(true).write(true).open(&partial.output)?;
         let permissions = match fs::metadata(&dest) {
             Ok(md) => Some(md.permissions()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        if let Some(p) = permissions {
-            tmp.as_file().set_permissions(p)?;
+        if let Some(permissions) = permissions {
+            tmp.set_permissions(permissions)?;
         } else {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                tmp.as_file().set_permissions(fs::Permissions::from_mode(0o644))?;
+                tmp.set_permissions(fs::Permissions::from_mode(0o644))?;
             }
         }
-        let mut existing = if f.chunks.iter().any(|c| local_at.contains_key(&c.hash)) {
+        let mut existing = if f.chunks.iter().any(|chunk| local_at.contains_key(&chunk.hash)) {
             Some(BufReader::with_capacity(1 << 20, File::open(&dest)?))
         } else {
             None
         };
+        let mut saved = match &partial.input {
+            Some((path, _)) if !partial_at.is_empty() => {
+                Some(BufReader::with_capacity(1 << 20, File::open(path)?))
+            }
+            _ => None,
+        };
         for chunk in &f.chunks {
             let (data, transferred) = if let Some((start, len)) = local_at.get(&chunk.hash) {
-                let rd = existing.as_mut().context("missing local reader")?;
-                rd.seek(SeekFrom::Start(*start))?;
+                let reader = existing.as_mut().context("missing local reader")?;
+                reader.seek(SeekFrom::Start(*start))?;
                 let mut data = vec![0u8; *len as usize];
-                rd.read_exact(&mut data)?;
+                reader.read_exact(&mut data)?;
+                (data, false)
+            } else if let Some((start, len)) = partial_at.get(&chunk.hash) {
+                let reader = saved.as_mut().context("missing partial reader")?;
+                reader.seek(SeekFrom::Start(*start))?;
+                let mut data = vec![0u8; *len as usize];
+                reader.read_exact(&mut data)?;
                 (data, false)
             } else {
                 match recv(stream)? {
-                    Msg::Chunk(data) => {
+                    Msg::Chunk { compressed, data } => {
                         received += data.len() as u64;
+                        let data = if compressed {
+                            let mut unpacked = Vec::with_capacity(chunk.len as usize);
+                            DeflateDecoder::new(data.as_slice())
+                                .take(chunk.len + 1)
+                                .read_to_end(&mut unpacked)?;
+                            unpacked
+                        } else {
+                            data
+                        };
                         (data, true)
                     }
                     _ => bail!("expected a chunk for {}", f.path),
@@ -777,24 +837,37 @@ fn assemble(
                 progress.advance(data.len() as u64);
             }
         }
-        tmp.as_file().sync_all()?;
-        let (content, chunks) = describe(tmp.path())?;
+        tmp.sync_all()?;
+        drop(tmp);
+        let (content, chunks) = describe(&partial.output)?;
         if content != f.content {
             bail!("content mismatch in {}", f.path);
         }
         progress.finish_file();
-        staged.push((f.path.clone(), tmp.into_temp_path(), content, chunks));
+        staged.push((f.path.clone(), partial.output.clone(), partial.slots.clone(), content, chunks));
     }
     match recv(stream)? {
         Msg::Done => {}
         _ => bail!("expected the end of the chunk stream"),
     }
     let mut published = Vec::new();
-    for (rel, tmp, content, chunks) in staged {
+    for (rel, tmp, slots, content, chunks) in staged {
         let dest = safe_join(root, &rel)?;
-        tmp.persist(&dest)?;
+        tempfile::TempPath::try_from_path(tmp)?.persist(&dest)?;
+        for slot in slots {
+            match fs::remove_file(slot) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let md = fs::metadata(dest)?;
         published.push((rel, Entry { size: md.len(), mtime: mtime_ns(&md), content, chunks }));
+    }
+    match fs::remove_dir(root.join(PARTIAL_DIR)) {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {}
+        Err(e) => return Err(e.into()),
     }
     Ok((received, written, published))
 }
@@ -859,21 +932,91 @@ fn receive_tree(
     if opts.dry {
         plan.print();
     } else {
+        fs::create_dir_all(&local.root)?;
+        let mut stack = vec![local.root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() && name.starts_with(".bbrsync-") && name.ends_with(TMP_SUFFIX) {
+                    fs::remove_file(entry.path())?;
+                } else if metadata.is_dir() && !is_link(&metadata) && name != PARTIAL_DIR {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        let partial_dir = local.root.join(PARTIAL_DIR);
+        fs::create_dir_all(&partial_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&partial_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let expected: BTreeSet<_> = plan
+            .refs
+            .iter()
+            .flat_map(|file| partial_paths(&local.root, &file.path, &file.content))
+            .collect();
+        for entry in fs::read_dir(&partial_dir)? {
+            let entry = entry?;
+            if !expected.contains(&entry.path()) {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() || is_link(&metadata) {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        let mut partials = HashMap::new();
+        for file in &plan.refs {
+            let slots = partial_paths(&local.root, &file.path, &file.content);
+            let wanted: HashMap<_, _> = file.chunks.iter().map(|chunk| (chunk.hash, chunk.len)).collect();
+            let mut best = None;
+            for (index, path) in slots.iter().enumerate() {
+                match fs::metadata(path) {
+                    Ok(metadata) if metadata.is_file() => match describe(path) {
+                        Ok((_, chunks)) => {
+                            let useful = chunks
+                                .iter()
+                                .filter(|chunk| wanted.get(&chunk.hash) == Some(&chunk.len))
+                                .map(|chunk| chunk.len)
+                                .sum::<u64>();
+                            if useful > best.as_ref().map_or(0, |(_, useful, _)| *useful) {
+                                best = Some((index, useful, chunks));
+                            }
+                        }
+                        Err(_) => fs::remove_file(path)?,
+                    },
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let (input, output) = match best {
+                Some((index, useful, chunks)) if useful > 0 => {
+                    (Some((slots[index].clone(), chunks)), slots[1 - index].clone())
+                }
+                _ => (None, slots[0].clone()),
+            };
+            partials.insert(file.path.clone(), Partial { slots, input, output });
+        }
         let needs = plan
             .refs
             .iter()
-            .map(|f| {
-                let held = chunk_index(local.entries.get(&f.path));
+            .map(|file| {
+                let mut held = chunk_index(local.entries.get(&file.path));
+                if let Some((_, chunks)) = &partials[&file.path].input {
+                    held.extend(chunks_index(chunks));
+                }
                 FileNeed {
-                    path: f.path.clone(),
-                    send: f.chunks.iter().map(|c| !held.contains_key(&c.hash)).collect(),
+                    path: file.path.clone(),
+                    send: file.chunks.iter().map(|chunk| !held.contains_key(&chunk.hash)).collect(),
                 }
             })
             .collect();
         send(w, &Msg::Needs(needs))?;
-        fs::create_dir_all(&local.root)?;
         let (received, assembled, published) =
-            assemble(&local.root, &plan.refs, &local.entries, r, progress)?;
+            assemble(&local.root, &plan.refs, &local.entries, &partials, r, progress)?;
         stats = Stats { files: published.len() as u64, received, assembled, deleted: 0 };
         local.entries.extend(published);
         // Only planned deletions, after every file has verified and published.
@@ -941,6 +1084,7 @@ fn sync(
     cache_dir: &Path,
     pull: bool,
     opts: &Opts,
+    hide_progress: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let local = if pull {
@@ -976,9 +1120,8 @@ fn sync(
         _ => bail!("unexpected reply to hello"),
     }
     let stderr = std::io::stderr();
-    let visible = stderr.is_terminal() && !opts.dry;
     let mut stderr = stderr.lock();
-    let mut progress = Progress::new(visible, &mut stderr);
+    let mut progress = Progress::new(!hide_progress && !opts.dry, &mut stderr);
     let stats = transfer(&mut w, &mut r, &local, cache_dir, !pull, opts, &mut progress)?;
     if !opts.dry {
         let elapsed = started.elapsed();
@@ -1114,6 +1257,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
         std::env::var("BBRSYNC_TOKEN").unwrap_or_default()
     };
     let mut opts = Opts::default();
+    let mut hide_progress = false;
     let mut ignore = Vec::new();
     while let Some(arg) = args.next() {
         let (key, inline) = match arg.split_once('=') {
@@ -1160,6 +1304,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("--dry-run", false) if inline.is_none() => opts.dry = true,
             ("--full", false) if inline.is_none() => opts.full = true,
             ("--delete", false) if inline.is_none() => opts.delete = true,
+            ("--hide-progress", false) if inline.is_none() => hide_progress = true,
             ("--version", _) if inline.is_none() => {
                 println!("bbrsync {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -1171,7 +1316,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("-h" | "--help", _) if inline.is_none() => {
                 println!(
                     "usage:\n  \
-                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
+                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--hide-progress] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
                      bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--cache-dir=DIR] [--token=TOKEN]\n\n\
                      --source is read from; --dest receives changes. Their order does not matter.\n\
                      Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
@@ -1180,7 +1325,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                      Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
                      --dry-run previews without writes. --delete also removes destination-only files.\n\
                      --cache-dir overrides this process's operating-system cache directory.\n\
-                     Interactive transfers show progress on standard error; redirected runs stay quiet.\n\
+                     Transfers show progress on standard error; --hide-progress suppresses it.\n\
                      Existing destination files can be overwritten even without --delete. Keep backups.\n\
                      Use only on a trusted local network or VPN; traffic is not encrypted.\n\
                      --version prints the version; --license prints the MIT license."
@@ -1217,6 +1362,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
         &cache_dir,
         pull,
         &opts,
+        hide_progress,
     )
 }
 

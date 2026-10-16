@@ -41,6 +41,7 @@ impl Tree {
                 &self.cache,
                 pull,
                 opts,
+                true,
             )
         })
     }
@@ -90,6 +91,13 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     out
+}
+
+fn public_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    snapshot(root)
+        .into_iter()
+        .filter(|(path, _)| !path.components().next().is_some_and(|part| is_internal(&part.as_os_str().to_string_lossy())))
+        .collect()
 }
 
 fn one_file(path: &str, data: &[u8]) -> FileRef {
@@ -254,10 +262,12 @@ fn no_global_temp_or_empty_directory_sweep() {
     put(&tree.remote, "keep", b"old");
     put(&tree.remote, "extra", b"delete this");
     put(&tree.remote, "old.bbrsync-tmp", b"not ours");
+    put(&tree.remote, ".bbrsync-abandoned.bbrsync-tmp", b"ours");
     fs::create_dir_all(tree.remote.join("empty/valuable-structure")).unwrap();
     fs::create_dir_all(tree.remote.join(".git/empty")).unwrap();
     tree.run(false, &Opts { delete: true, ..options() }).unwrap();
     assert_eq!(fs::read(tree.remote.join("old.bbrsync-tmp")).unwrap(), b"not ours");
+    assert!(!tree.remote.join(".bbrsync-abandoned.bbrsync-tmp").exists());
     assert!(tree.remote.join("empty/valuable-structure").is_dir());
     assert!(tree.remote.join(".git/empty").is_dir());
 }
@@ -396,10 +406,10 @@ fn failed_transfer_does_not_publish_or_delete() {
         }
         let mut messages = vec![
             Msg::Diffs(Plan { refs, deletes: vec!["extra".into()], total: 2 }),
-            Msg::Chunk(b"new a".to_vec()),
+            Msg::Chunk { compressed: false, data: b"new a".to_vec() },
         ];
         if fail_hash {
-            messages.push(Msg::Chunk(b"new b".to_vec()));
+            messages.push(Msg::Chunk { compressed: false, data: b"new b".to_vec() });
             messages.push(Msg::Done);
         } // Otherwise the stream ends halfway through the transfer.
         let mut input = wire(messages);
@@ -415,7 +425,8 @@ fn failed_transfer_does_not_publish_or_delete() {
             &mut progress,
         )
         .is_err());
-        assert_eq!(snapshot(&tree.local), before);
+        assert_eq!(public_snapshot(&tree.local), before);
+        assert!(tree.local.join(PARTIAL_DIR).is_dir());
     }
 }
 
@@ -484,6 +495,7 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
         (vec!["--dest=host:bad/dest", "--source=local", "--dest=host:bad/other"], "--dest was specified more than once"),
         (vec!["local", ":/remote", "--host=host:bad"], "unexpected argument"),
         (vec!["--source=local", "--dest=host:bad/dest", "--delete=false"], "unexpected argument"),
+        (vec!["--source=local", "--dest=host:bad/dest", "--hide-progress=false"], "unexpected argument"),
         (vec!["serve"], "missing --listen"),
         (vec!["serve", "--listen=host:bad", "--listen=other:bad"], "--listen was specified more than once"),
     ] {
@@ -493,7 +505,7 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
 }
 
 #[test]
-fn progress_is_quiet_when_redirected_and_rewrites_an_interactive_line() {
+fn progress_can_be_hidden_and_rewrites_the_active_line() {
     let mut redirected = Vec::new();
     {
         let mut progress = Progress::new(false, &mut redirected);
@@ -546,6 +558,7 @@ fn named_flags_transfer_in_both_directions_regardless_of_order_or_equals_style()
                     if reversed { endpoints.reverse(); }
                     let mut args = vec![
                         "--token=".to_owned(),
+                        "--hide-progress".to_owned(),
                         "--ignore=ignored".to_owned(),
                         format!("--cache-dir={}", tree.cache.display()),
                     ];
@@ -695,7 +708,7 @@ fn wrong_chunk_order_or_extra_chunks_cannot_publish_or_delete() {
             deletes: vec!["extra".into()],
             total: 2,
         })];
-        messages.extend(data.into_iter().map(|d| Msg::Chunk(d.to_vec())));
+        messages.extend(data.into_iter().map(|data| Msg::Chunk { compressed: false, data: data.to_vec() }));
         messages.push(Msg::Done);
         let mut input = wire(messages);
         let mut sink = std::io::sink();
@@ -710,8 +723,113 @@ fn wrong_chunk_order_or_extra_chunks_cannot_publish_or_delete() {
             &mut progress,
         )
         .is_err());
-        assert_eq!(snapshot(&tree.local), before);
+        assert_eq!(public_snapshot(&tree.local), before);
     }
+}
+
+#[test]
+fn compressible_chunks_use_less_wire_data_and_roundtrip() {
+    let tree = Tree::new();
+    let data = vec![0u8; MAX_CHUNK * 3];
+    put(&tree.local, "file", &data);
+    let source = Local::scan(&tree.local, &tree.cache, &options(), false).unwrap();
+    let entry = &source.entries["file"];
+    let needs = [FileNeed { path: "file".into(), send: vec![true; entry.chunks.len()] }];
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    send_chunks(&mut output, &source.root, &source.entries, &needs, &mut progress).unwrap();
+    let mut messages = std::io::Cursor::new(output);
+    let mut wire_bytes = 0;
+    for chunk in &entry.chunks {
+        let Msg::Chunk { compressed, data: packed } = recv(&mut messages).unwrap() else { panic!() };
+        assert!(compressed);
+        wire_bytes += packed.len();
+        let mut unpacked = Vec::new();
+        DeflateDecoder::new(packed.as_slice()).read_to_end(&mut unpacked).unwrap();
+        assert_eq!(hash_of(&unpacked), chunk.hash);
+    }
+    assert!(matches!(recv(&mut messages).unwrap(), Msg::Done));
+    assert!(wire_bytes < data.len() / 10);
+}
+
+#[test]
+fn incompressible_chunks_stay_raw() {
+    let tree = Tree::new();
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let data: Vec<_> = (0..MAX_CHUNK * 3).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    put(&tree.local, "file", &data);
+    let source = Local::scan(&tree.local, &tree.cache, &options(), false).unwrap();
+    let entry = &source.entries["file"];
+    let needs = [FileNeed { path: "file".into(), send: vec![true; entry.chunks.len()] }];
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    send_chunks(&mut output, &source.root, &source.entries, &needs, &mut progress).unwrap();
+    let mut messages = std::io::Cursor::new(output);
+    for chunk in &entry.chunks {
+        let Msg::Chunk { compressed, data } = recv(&mut messages).unwrap() else { panic!() };
+        assert!(!compressed);
+        assert_eq!(hash_of(&data), chunk.hash);
+    }
+    assert!(matches!(recv(&mut messages).unwrap(), Msg::Done));
+}
+
+#[test]
+fn interrupted_partials_are_reused_and_obsolete_temps_are_cleaned() {
+    let tree = Tree::new();
+    let data: Vec<_> = (0..MAX_CHUNK * 6).map(|i| (i % 251) as u8).collect();
+    put(&tree.remote, "file", &data);
+    let (content, chunks) = describe(&tree.remote.join("file")).unwrap();
+    assert!(chunks.len() >= 4);
+    let cutoff = chunks.len() / 2;
+    let slots = partial_paths(&tree.local, "file", &content);
+    fs::create_dir_all(slots[0].parent().unwrap()).unwrap();
+    let first = (chunks[0].start + chunks[0].len) as usize;
+    let longer = (chunks[cutoff - 1].start + chunks[cutoff - 1].len) as usize;
+    fs::write(&slots[0], &data[..first]).unwrap();
+    fs::write(&slots[1], &data[..longer]).unwrap();
+    put(&tree.local, ".bbrsync-abandoned.bbrsync-tmp", b"old random temp");
+    fs::write(tree.local.join(PARTIAL_DIR).join("obsolete"), b"old partial").unwrap();
+    let mut messages = vec![Msg::Diffs(Plan {
+        refs: vec![FileRef { path: "file".into(), content, chunks: chunks.clone() }],
+        deletes: vec![],
+        total: 1,
+    })];
+    for chunk in &chunks[cutoff..] {
+        let start = chunk.start as usize;
+        let finish = start + chunk.len as usize;
+        messages.push(Msg::Chunk { compressed: false, data: data[start..finish].to_vec() });
+    }
+    messages.push(Msg::Done);
+    let mut input = wire(messages);
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    transfer(
+        &mut output,
+        &mut input,
+        &tree.local,
+        &tree.cache,
+        false,
+        &options(),
+        &mut progress,
+    ).unwrap();
+    assert_eq!(fs::read(tree.local.join("file")).unwrap(), data);
+    assert!(!tree.local.join(PARTIAL_DIR).exists());
+    assert!(!tree.local.join(".bbrsync-abandoned.bbrsync-tmp").exists());
+    let mut output = std::io::Cursor::new(output);
+    assert!(matches!(recv(&mut output).unwrap(), Msg::Files(_)));
+    let Msg::Needs(needs) = recv(&mut output).unwrap() else { panic!() };
+    assert_eq!(needs.len(), 1);
+    assert_eq!(needs[0].send, (0..chunks.len()).map(|index| index >= cutoff).collect::<Vec<_>>());
+    let Msg::Ok(stats) = recv(&mut output).unwrap() else { panic!() };
+    assert_eq!(stats.received, chunks[cutoff..].iter().map(|chunk| chunk.len).sum::<u64>());
 }
 
 #[test]
