@@ -1,6 +1,6 @@
 [package]
 name = "bbrsync"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Chunk-based file synchronization for trusted local networks and VPNs"
 license = "MIT"
@@ -14,7 +14,12 @@ anyhow = "1"
 bincode = "1"
 blake3 = "1"
 fastcdc = "5"
+flate2 = { version = "1.1.10", default-features = false, features = ["miniz_oxide"] }
+getrandom = "0.4"
+kcp = "0.6"
+reed-solomon-erasure = { version = "6", default-features = false }
 serde = { version = "1", features = ["derive"] }
+socket2 = "0.6"
 tempfile = "3"
 
 [profile.release]

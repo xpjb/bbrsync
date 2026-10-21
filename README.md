@@ -17,8 +17,8 @@ Neither an AI review nor a successful test guarantees safety.
 ## Network security
 
 Use it only on a **trusted local network or VPN**. Don't expose it to the public
-internet. Traffic is plain TCP: bbrsync does not provide encryption or TLS. The
-optional token does not encrypt data.
+internet. TCP and KCP/UDP traffic are unencrypted: bbrsync does not provide TLS.
+The optional token does not encrypt data.
 
 A peer with access can read and write files with the daemon account's permissions,
 within the configured `--root`. This is a trusted-peer tool, not a public service
@@ -26,7 +26,8 @@ or a sandbox against malicious peers or local processes.
 
 ## Usage
 
-Start a daemon bound to its local-network or VPN address. `--listen` is required:
+Start a daemon bound to its local-network or VPN address. `--listen` is required.
+The daemon binds TCP and UDP/KCP on the same address and port:
 
 ```sh
 bbrsync serve --listen=192.168.1.10:7777 --root=/srv/site
@@ -48,6 +49,9 @@ bbrsync --source=website --dest=vibe:7777/srv/site
 
 # Copy it from the daemon into the local website directory.
 bbrsync --dest=website --source=vibe:7777/srv/site
+
+# Use reliable UDP/KCP instead of the default TCP transport.
+bbrsync --kcp --dest=website --source=vibe:7777/srv/site
 
 # Preview before writing anything.
 bbrsync --source=website --dest=vibe:7777/srv/site --dry-run
@@ -77,7 +81,17 @@ not on a dry run. `BBRSYNC_TOKEN` supplies the client's optional token default.
 - **`--full`:** bypass hash caches and re-read file contents.
 - **`--cache-dir DIR`:** override this process's operating-system cache directory.
   The client and daemon configure their caches independently.
+- **`--hide-progress`:** suppress transfer progress on standard error.
+- **`--kcp`:** use reliable UDP/KCP. The daemon always supports both transports.
 - **`-i/--ignore PATTERN`:** add an ignore rule, applied to both sides.
+
+KCP requires direct UDP reachability to the daemon. A TCP-only proxy or tunnel cannot
+carry it; use TCP unless the daemon's UDP port is reachable through the LAN or VPN.
+
+Real transfers show per-file progress on standard error by default, including from
+Git Bash and redirected processes. Use `--hide-progress` for quiet scripts and log
+capture. Dry runs do not show progress. Totals report compressed chunk payload bytes
+sent across the network, excluding chunks reused at the destination.
 
 ## Deletion safety
 
@@ -93,8 +107,9 @@ Before changing files, the receiver checks the transfer plan:
   Resolved roots are checked against `--root`; the filesystem root and Unix
   system trees such as `/etc` and `/usr` are refused as destinations.
 
-Unrelated empty directories and old temporary files are left alone. These checks
-protect against some mistakes, not every failure or a hostile local process
+Unrelated empty directories and user files are left alone. After preflight succeeds,
+bbrsync removes only its reserved legacy `.bbrsync-*.bbrsync-tmp` files and obsolete
+partial slots. These checks protect against some mistakes, not every failure or a hostile local process
 racing filesystem changes. They cannot make a wrong source/destination choice
 harmless, especially when files are overwritten.
 
@@ -118,11 +133,21 @@ Dotfiles such as `.env` are ordinary content unless explicitly ignored.
 
 ## Limits
 
-FastCDC uses 4 / 16 / 64 KiB minimum/average/maximum chunks and BLAKE3 hashes. File
-bytes are streamed; manifests and chunk indexes occupy memory proportional to
-the tree. Per-root caches keyed by size and modification time avoid rehashing
-unchanged files. Changes preserving both values require `--full`. Corrupt caches
-are discarded and rebuilt.
+FastCDC uses 4 / 16 / 64 KiB minimum/average/maximum chunks and BLAKE3 hashes.
+Missing chunks use fast DEFLATE compression when it reduces their size, otherwise
+they stay raw. KCP uses ordered stream mode, 1200-byte UDP datagrams, 10 ms updates,
+disabled congestion-window throttling and 1024-packet send/receive windows. It
+protects connection startup with duplicate datagrams and uses KCP's smoothed RTT and
+RTT variance estimator. After the first valid acknowledgment, one-second samples of
+actual data retransmissions select between zero and five Reed-Solomon parity shards
+for each 10 data shards. Protection can increase but cannot oscillate downward during
+a connection; heavy protection also uses a 512-packet window and a conservative
+one-second retransmission floor. Clean links remain uncoded. FEC groups and all
+transport queues remain bounded, and the file protocol still confirms completion.
+File bytes are streamed; manifests and chunk indexes occupy memory proportional to
+the tree. Per-root caches keyed by size and modification time avoid
+rehashing unchanged files. Changes preserving both values require `--full`. Corrupt
+caches are discarded and rebuilt.
 
 Caches live outside synchronized trees. The defaults are
 `$XDG_CACHE_HOME/bbrsync` or `~/.cache/bbrsync` on Linux,
@@ -130,10 +155,12 @@ Caches live outside synchronized trees. The defaults are
 `BBRSYNC_CACHE_DIR` and `--cache-dir` override the default for the current
 process. Cache filenames are derived from normalized absolute root paths.
 
-Changed files are assembled in temporary files, verified, synced, then published
-by rename. Existing destination permissions are preserved. Publication is atomic
-**per file**, not across the whole tree: a failed run can leave some files updated
-and others unchanged.
+Changed files are assembled in two deterministic slots under `.bbrsync-partials`.
+A retry reuses every verified chunk from the better slot and writes the other, so
+repeated interruptions keep moving forward. Complete files are verified, synced,
+then published by rename. Existing destination permissions are preserved.
+Publication is atomic **per file**, not across the whole tree: a failed run can
+leave some files updated and others unchanged.
 
 Regular UTF-8-named files are supported. Source symlinks are skipped; destination
 link conflicts are refused. Empty directories, timestamps, ownership and source
@@ -156,6 +183,6 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 cargo nextest run
 ```
 
-Wire protocol: **v1**. Tests use disposable directories and test-owned loopback
-connections, never a live daemon or an existing data tree. Compiled binaries are
-available in GitHub Releases.
+Wire protocol: **v2** over TCP or KCP. Tests use disposable directories and
+test-owned loopback connections, never a live daemon or an existing data tree.
+Compiled binaries are available in GitHub Releases.

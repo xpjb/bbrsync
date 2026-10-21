@@ -1,6 +1,9 @@
-//! All filesystem tests use fresh disposable directories. The only TCP peer is
-//! a test-owned loopback listener on an OS-assigned port; never a real daemon.
+//! All filesystem tests use fresh disposable directories. Network peers use
+//! test-owned loopback listeners on OS-assigned ports; never a real daemon.
 use super::*;
+use std::net::{TcpListener, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 struct Tree {
@@ -34,6 +37,7 @@ impl Tree {
     fn run(&self, pull: bool, opts: &Opts) -> Result<()> {
         self.with_peer(|host| {
             sync(
+                &transport::tcp::TCP,
                 &self.local,
                 self.remote.to_str().unwrap(),
                 host,
@@ -41,6 +45,7 @@ impl Tree {
                 &self.cache,
                 pull,
                 opts,
+                true,
             )
         })
     }
@@ -51,10 +56,14 @@ impl Tree {
         let base = self.base.clone();
         let cache = self.cache.clone();
         let daemon = std::thread::spawn(move || {
-            let (sock, _) = listener.accept()?;
-            sock.set_read_timeout(Some(Duration::from_secs(5)))?;
-            sock.set_write_timeout(Some(Duration::from_secs(5)))?;
-            session(sock, Some(&base), "", &cache)
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let connection = Connection {
+                reader: Box::new(stream.try_clone()?),
+                writer: Box::new(stream),
+            };
+            session(connection, Some(&base), "", &cache)
         });
         let result = client(&host);
         let server = daemon.join().expect("test daemon panicked");
@@ -90,6 +99,13 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     out
+}
+
+fn public_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    snapshot(root)
+        .into_iter()
+        .filter(|(path, _)| !path.components().next().is_some_and(|part| is_internal(&part.as_os_str().to_string_lossy())))
+        .collect()
 }
 
 fn one_file(path: &str, data: &[u8]) -> FileRef {
@@ -254,10 +270,12 @@ fn no_global_temp_or_empty_directory_sweep() {
     put(&tree.remote, "keep", b"old");
     put(&tree.remote, "extra", b"delete this");
     put(&tree.remote, "old.bbrsync-tmp", b"not ours");
+    put(&tree.remote, ".bbrsync-abandoned.bbrsync-tmp", b"ours");
     fs::create_dir_all(tree.remote.join("empty/valuable-structure")).unwrap();
     fs::create_dir_all(tree.remote.join(".git/empty")).unwrap();
     tree.run(false, &Opts { delete: true, ..options() }).unwrap();
     assert_eq!(fs::read(tree.remote.join("old.bbrsync-tmp")).unwrap(), b"not ours");
+    assert!(!tree.remote.join(".bbrsync-abandoned.bbrsync-tmp").exists());
     assert!(tree.remote.join("empty/valuable-structure").is_dir());
     assert!(tree.remote.join(".git/empty").is_dir());
 }
@@ -344,6 +362,8 @@ fn receiver_rejects_unrequested_deletion_before_writing() {
         deletes: vec!["extra".into()],
         total: 1,
     })]);
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
     let err = transfer(
         &mut Vec::new(),
         &mut input,
@@ -351,6 +371,7 @@ fn receiver_rejects_unrequested_deletion_before_writing() {
         &tree.cache,
         false,
         &options(),
+        &mut progress,
     )
     .unwrap_err();
     assert!(format!("{err:#}").contains("without --delete"));
@@ -393,23 +414,27 @@ fn failed_transfer_does_not_publish_or_delete() {
         }
         let mut messages = vec![
             Msg::Diffs(Plan { refs, deletes: vec!["extra".into()], total: 2 }),
-            Msg::Chunk(b"new a".to_vec()),
+            Msg::Chunk { compressed: false, data: b"new a".to_vec() },
         ];
         if fail_hash {
-            messages.push(Msg::Chunk(b"new b".to_vec()));
+            messages.push(Msg::Chunk { compressed: false, data: b"new b".to_vec() });
             messages.push(Msg::Done);
         } // Otherwise the stream ends halfway through the transfer.
         let mut input = wire(messages);
+        let mut sink = std::io::sink();
+        let mut progress = Progress::new(false, &mut sink);
         assert!(transfer(
             &mut Vec::new(),
             &mut input,
             &tree.local,
             &tree.cache,
             false,
-            &Opts { delete: true, ..options() }
+            &Opts { delete: true, ..options() },
+            &mut progress,
         )
         .is_err());
-        assert_eq!(snapshot(&tree.local), before);
+        assert_eq!(public_snapshot(&tree.local), before);
+        assert!(tree.local.join(PARTIAL_DIR).is_dir());
     }
 }
 
@@ -476,14 +501,46 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
         (vec!["--source=local", "--dest="], "--dest needs a value"),
         (vec!["--source=local", "--source=other", "--dest=host:bad/dest"], "--source was specified more than once"),
         (vec!["--dest=host:bad/dest", "--source=local", "--dest=host:bad/other"], "--dest was specified more than once"),
+        (vec!["--source=local", "--dest=host:7777/dest", "--kcp=false"], "unexpected argument"),
+        (vec!["serve", "--kcp"], "unexpected argument"),
         (vec!["local", ":/remote", "--host=host:bad"], "unexpected argument"),
         (vec!["--source=local", "--dest=host:bad/dest", "--delete=false"], "unexpected argument"),
+        (vec!["--source=local", "--dest=host:bad/dest", "--hide-progress=false"], "unexpected argument"),
         (vec!["serve"], "missing --listen"),
         (vec!["serve", "--listen=host:bad", "--listen=other:bad"], "--listen was specified more than once"),
     ] {
         let error = super::run(args.into_iter().map(str::to_owned)).unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}; wanted {expected}");
     }
+}
+
+#[test]
+fn progress_can_be_hidden_and_rewrites_the_active_line() {
+    let mut redirected = Vec::new();
+    {
+        let mut progress = Progress::new(false, &mut redirected);
+        progress.status("scanning local files...");
+        progress.begin_file(1, 2, "large file.bin", 100);
+        progress.started = std::time::Instant::now() - Duration::from_secs(1);
+        progress.advance(50);
+        progress.finish_file();
+    }
+    assert!(redirected.is_empty());
+
+    let mut interactive = Vec::new();
+    {
+        let mut progress = Progress::new(true, &mut interactive);
+        progress.status("scanning local files...");
+        progress.begin_file(1, 2, "large file.bin", 100);
+        progress.started = std::time::Instant::now() - Duration::from_secs(1);
+        progress.advance(50);
+        progress.finish_file();
+    }
+    let interactive = String::from_utf8(interactive).unwrap();
+    assert!(interactive.contains("scanning local files..."));
+    assert!(interactive.contains("[1/2] large file.bin   50%"));
+    assert!(interactive.contains("[1/2] large file.bin  100%"));
+    assert!(interactive.contains('\r'));
 }
 
 #[test]
@@ -511,6 +568,7 @@ fn named_flags_transfer_in_both_directions_regardless_of_order_or_equals_style()
                     if reversed { endpoints.reverse(); }
                     let mut args = vec![
                         "--token=".to_owned(),
+                        "--hide-progress".to_owned(),
                         "--ignore=ignored".to_owned(),
                         format!("--cache-dir={}", tree.cache.display()),
                     ];
@@ -528,6 +586,157 @@ fn named_flags_transfer_in_both_directions_regardless_of_order_or_equals_style()
             }
         }
     }
+}
+
+#[test]
+fn kcp_named_flag_transfers_in_both_directions() {
+    for pull in [false, true] {
+        let tree = Tree::new();
+        let (src, dst) = tree.ends(pull);
+        put(src, "file", b"fresh over KCP");
+        put(dst, "file", b"old");
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let mut incoming = transport::kcp::KCP.incoming(&host).unwrap();
+        let base = tree.base.clone();
+        let cache = tree.cache.clone();
+        let daemon = std::thread::spawn(move || {
+            let connection = incoming.next().context("KCP listener ended")??;
+            session(connection, Some(&base), "", &cache)
+        });
+        let local = tree.local.to_str().unwrap().to_owned();
+        let path = tree.remote.to_str().unwrap();
+        let remote = format!("{host}/{}", path.strip_prefix('/').unwrap_or(path));
+        let (source, dest) = if pull { (remote, local) } else { (local, remote) };
+        let result = run([
+            format!("--source={source}"),
+            format!("--dest={dest}"),
+            format!("--cache-dir={}", tree.cache.display()),
+            "--hide-progress".into(),
+            "--kcp".into(),
+        ].into_iter());
+        let server = daemon.join().expect("KCP test daemon panicked");
+        result.and(server).unwrap();
+        assert_eq!(fs::read(dst.join("file")).unwrap(), b"fresh over KCP");
+    }
+}
+
+#[test]
+fn kcp_stream_survives_loss_reordering_and_duplicates() {
+    let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_address = probe.local_addr().unwrap().to_string();
+    drop(probe);
+    let mut incoming = transport::kcp::KCP.incoming(&server_address).unwrap();
+
+    let client_side = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client_side.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+    let proxy_address = client_side.local_addr().unwrap().to_string();
+    let server_side = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server_side.connect(&server_address).unwrap();
+    server_side.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_stop = stop.clone();
+    let proxy = std::thread::spawn(move || {
+        let mut client = None;
+        let mut to_server = vec![0u8; 65536];
+        let mut to_client = vec![0u8; 65536];
+        let mut held_server = None;
+        let mut held_client = None;
+        let mut sent_server = 0usize;
+        let mut sent_client = 0usize;
+        let relay = |socket: &std::net::UdpSocket, packet: &[u8]| match socket.send(packet) {
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) => {}
+            Err(error) => panic!("proxy send failed: {error}"),
+        };
+        while !proxy_stop.load(Ordering::Acquire) {
+            match client_side.recv_from(&mut to_server) {
+                Ok((count, address)) => {
+                    client = Some(address);
+                    sent_server += 1;
+                    let packet = to_server[..count].to_vec();
+                    if sent_server % 6 != 0 {
+                        if sent_server % 5 == 0 {
+                            held_server = Some(packet);
+                        } else {
+                            relay(&server_side, &packet);
+                            if sent_server % 11 == 0 {
+                                relay(&server_side, &packet);
+                            }
+                            if let Some(held) = held_server.take() {
+                                relay(&server_side, &held);
+                            }
+                        }
+                    }
+                }
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) => {}
+                Err(error) => panic!("client-side proxy receive failed: {error}"),
+            }
+            match server_side.recv(&mut to_client) {
+                Ok(count) => {
+                    sent_client += 1;
+                    let packet = to_client[..count].to_vec();
+                    if sent_client % 6 != 0 {
+                        if sent_client % 5 == 0 {
+                            held_client = Some(packet);
+                        } else if let Some(address) = client {
+                            client_side.send_to(&packet, address).unwrap();
+                            if sent_client % 11 == 0 {
+                                client_side.send_to(&packet, address).unwrap();
+                            }
+                            if let Some(held) = held_client.take() {
+                                client_side.send_to(&held, address).unwrap();
+                            }
+                        }
+                    }
+                }
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) => {}
+                Err(error) => panic!("server-side proxy receive failed: {error}"),
+            }
+        }
+    });
+
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let payload: Vec<_> = (0..128 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    let Connection { mut reader, mut writer } = transport::kcp::KCP.connect(&proxy_address).unwrap();
+    writer.write_all(&(payload.len() as u64).to_le_bytes()).unwrap();
+    writer.write_all(&payload).unwrap();
+    writer.flush().unwrap();
+    let server_connection = incoming.next().context("KCP listener ended").unwrap().unwrap();
+    let server = std::thread::spawn(move || -> Result<()> {
+        let Connection { mut reader, mut writer } = server_connection;
+        let mut length = [0u8; 8];
+        reader.read_exact(&mut length)?;
+        let mut bytes = vec![0u8; u64::from_le_bytes(length) as usize];
+        reader.read_exact(&mut bytes)?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        let mut acknowledged = [0u8; 1];
+        reader.read_exact(&mut acknowledged)?;
+        if acknowledged != [1] {
+            bail!("KCP echo was not acknowledged");
+        }
+        drop(reader);
+        drop(writer);
+        Ok(())
+    });
+    let mut echoed = vec![0u8; payload.len()];
+    reader.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, payload);
+    writer.write_all(&[1]).unwrap();
+    writer.flush().unwrap();
+    drop(reader);
+    drop(writer);
+    server.join().expect("KCP stream server panicked").unwrap();
+    drop(incoming);
+    stop.store(true, Ordering::Release);
+    proxy.join().expect("lossy proxy panicked");
 }
 
 #[test]
@@ -660,20 +869,128 @@ fn wrong_chunk_order_or_extra_chunks_cannot_publish_or_delete() {
             deletes: vec!["extra".into()],
             total: 2,
         })];
-        messages.extend(data.into_iter().map(|d| Msg::Chunk(d.to_vec())));
+        messages.extend(data.into_iter().map(|data| Msg::Chunk { compressed: false, data: data.to_vec() }));
         messages.push(Msg::Done);
         let mut input = wire(messages);
+        let mut sink = std::io::sink();
+        let mut progress = Progress::new(false, &mut sink);
         assert!(transfer(
             &mut Vec::new(),
             &mut input,
             &tree.local,
             &tree.cache,
             false,
-            &Opts { delete: true, ..options() }
+            &Opts { delete: true, ..options() },
+            &mut progress,
         )
         .is_err());
-        assert_eq!(snapshot(&tree.local), before);
+        assert_eq!(public_snapshot(&tree.local), before);
     }
+}
+
+#[test]
+fn compressible_chunks_use_less_wire_data_and_roundtrip() {
+    let tree = Tree::new();
+    let data = vec![0u8; MAX_CHUNK * 3];
+    put(&tree.local, "file", &data);
+    let source = Local::scan(&tree.local, &tree.cache, &options(), false).unwrap();
+    let entry = &source.entries["file"];
+    let needs = [FileNeed { path: "file".into(), send: vec![true; entry.chunks.len()] }];
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    send_chunks(&mut output, &source.root, &source.entries, &needs, &mut progress).unwrap();
+    let mut messages = std::io::Cursor::new(output);
+    let mut wire_bytes = 0;
+    for chunk in &entry.chunks {
+        let Msg::Chunk { compressed, data: packed } = recv(&mut messages).unwrap() else { panic!() };
+        assert!(compressed);
+        wire_bytes += packed.len();
+        let mut unpacked = Vec::new();
+        DeflateDecoder::new(packed.as_slice()).read_to_end(&mut unpacked).unwrap();
+        assert_eq!(hash_of(&unpacked), chunk.hash);
+    }
+    assert!(matches!(recv(&mut messages).unwrap(), Msg::Done));
+    assert!(wire_bytes < data.len() / 10);
+}
+
+#[test]
+fn incompressible_chunks_stay_raw() {
+    let tree = Tree::new();
+    let mut state = 0x9e3779b97f4a7c15u64;
+    let data: Vec<_> = (0..MAX_CHUNK * 3).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    }).collect();
+    put(&tree.local, "file", &data);
+    let source = Local::scan(&tree.local, &tree.cache, &options(), false).unwrap();
+    let entry = &source.entries["file"];
+    let needs = [FileNeed { path: "file".into(), send: vec![true; entry.chunks.len()] }];
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    send_chunks(&mut output, &source.root, &source.entries, &needs, &mut progress).unwrap();
+    let mut messages = std::io::Cursor::new(output);
+    for chunk in &entry.chunks {
+        let Msg::Chunk { compressed, data } = recv(&mut messages).unwrap() else { panic!() };
+        assert!(!compressed);
+        assert_eq!(hash_of(&data), chunk.hash);
+    }
+    assert!(matches!(recv(&mut messages).unwrap(), Msg::Done));
+}
+
+#[test]
+fn interrupted_partials_are_reused_and_obsolete_temps_are_cleaned() {
+    let tree = Tree::new();
+    let data: Vec<_> = (0..MAX_CHUNK * 6).map(|i| (i % 251) as u8).collect();
+    put(&tree.remote, "file", &data);
+    let (content, chunks) = describe(&tree.remote.join("file")).unwrap();
+    assert!(chunks.len() >= 4);
+    let cutoff = chunks.len() / 2;
+    let slots = partial_paths(&tree.local, "file", &content);
+    fs::create_dir_all(slots[0].parent().unwrap()).unwrap();
+    let first = (chunks[0].start + chunks[0].len) as usize;
+    let longer = (chunks[cutoff - 1].start + chunks[cutoff - 1].len) as usize;
+    fs::write(&slots[0], &data[..first]).unwrap();
+    fs::write(&slots[1], &data[..longer]).unwrap();
+    put(&tree.local, ".bbrsync-abandoned.bbrsync-tmp", b"old random temp");
+    fs::write(tree.local.join(PARTIAL_DIR).join("obsolete"), b"old partial").unwrap();
+    let mut messages = vec![Msg::Diffs(Plan {
+        refs: vec![FileRef { path: "file".into(), content, chunks: chunks.clone() }],
+        deletes: vec![],
+        total: 1,
+    })];
+    for chunk in &chunks[cutoff..] {
+        let start = chunk.start as usize;
+        let finish = start + chunk.len as usize;
+        messages.push(Msg::Chunk { compressed: false, data: data[start..finish].to_vec() });
+    }
+    messages.push(Msg::Done);
+    let mut input = wire(messages);
+    let mut output = Vec::new();
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    transfer(
+        &mut output,
+        &mut input,
+        &tree.local,
+        &tree.cache,
+        false,
+        &options(),
+        &mut progress,
+    ).unwrap();
+    assert_eq!(fs::read(tree.local.join("file")).unwrap(), data);
+    assert!(!tree.local.join(PARTIAL_DIR).exists());
+    assert!(!tree.local.join(".bbrsync-abandoned.bbrsync-tmp").exists());
+    let mut output = std::io::Cursor::new(output);
+    assert!(matches!(recv(&mut output).unwrap(), Msg::Files(_)));
+    let Msg::Needs(needs) = recv(&mut output).unwrap() else { panic!() };
+    assert_eq!(needs.len(), 1);
+    assert_eq!(needs[0].send, (0..chunks.len()).map(|index| index >= cutoff).collect::<Vec<_>>());
+    let Msg::Ok(stats) = recv(&mut output).unwrap() else { panic!() };
+    assert_eq!(stats.received, chunks[cutoff..].iter().map(|chunk| chunk.len).sum::<u64>());
 }
 
 #[test]

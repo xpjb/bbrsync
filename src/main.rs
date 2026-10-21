@@ -1,23 +1,27 @@
-//! bbrsync: one-way, content-defined-chunk sync over a trusted TCP connection.
+//! bbrsync: one-way, content-defined-chunk sync over a trusted connection.
 //! Wire exchange:
 //! receiver Files -> sender Diffs -> receiver Needs -> sender Chunks/Done -> receiver Ok.
+
+mod transport;
 
 use anyhow::{bail, Context, Result};
 use bincode::Options as _;
 use fastcdc::v2020::StreamCDC;
+use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use transport::{Connection, Transport};
 use std::time::UNIX_EPOCH;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MIN_CHUNK: usize = 4096;
 const AVG_CHUNK: usize = 16384;
 const MAX_CHUNK: usize = 65536;
 const TMP_SUFFIX: &str = ".bbrsync-tmp";
+const PARTIAL_DIR: &str = ".bbrsync-partials";
 const IGNORE: &str = ".bbrsyncignore";
 const DEFAULT_PATTERNS: [&str; 7] =
     [".git", ".hg", ".svn", ".DS_Store", "Thumbs.db", "*.swp", "*~"];
@@ -62,6 +66,12 @@ struct Local {
     entries: Cache,
 }
 
+struct Partial {
+    slots: [PathBuf; 2],
+    input: Option<(PathBuf, Vec<ChunkRef>)>,
+    output: PathBuf,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Opts {
     delete: bool,
@@ -92,7 +102,7 @@ enum Msg {
     Files(Manifest),
     Diffs(Plan),
     Needs(Vec<FileNeed>),
-    Chunk(Vec<u8>),
+    Chunk { compressed: bool, data: Vec<u8> },
     Done,
     Ok(Stats),
     Error(String),
@@ -107,6 +117,160 @@ struct Pat {
 
 struct Patterns {
     lines: Vec<Pat>,
+}
+
+struct Progress<'a> {
+    out: &'a mut dyn Write,
+    visible: bool,
+    active: bool,
+    shown: bool,
+    index: usize,
+    count: usize,
+    path: String,
+    done: u64,
+    total: u64,
+    started: std::time::Instant,
+    last_draw: Option<std::time::Instant>,
+    line_width: usize,
+    line_visible: bool,
+}
+
+impl<'a> Progress<'a> {
+    fn new(visible: bool, out: &'a mut dyn Write) -> Self {
+        Self {
+            out,
+            visible,
+            active: false,
+            shown: false,
+            index: 0,
+            count: 0,
+            path: String::new(),
+            done: 0,
+            total: 0,
+            started: std::time::Instant::now(),
+            last_draw: None,
+            line_width: 0,
+            line_visible: false,
+        }
+    }
+
+    fn status(&mut self, text: &str) {
+        if !self.visible {
+            return;
+        }
+        self.active = false;
+        self.shown = false;
+        self.write_line(&format!("   {text}"), false);
+    }
+
+    fn begin_file(&mut self, index: usize, count: usize, path: &str, total: u64) {
+        self.clear_line();
+        self.active = self.visible && total > 0;
+        self.shown = false;
+        self.index = index;
+        self.count = count;
+        self.path = if path.chars().count() <= 48 {
+            path.to_owned()
+        } else {
+            let tail: String =
+                path.chars().rev().take(47).collect::<String>().chars().rev().collect();
+            format!("…{tail}")
+        };
+        self.done = 0;
+        self.total = total;
+        self.started = std::time::Instant::now();
+        self.last_draw = None;
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        if !self.active {
+            return;
+        }
+        self.done = self.done.saturating_add(bytes).min(self.total);
+        let now = std::time::Instant::now();
+        if self.done < self.total
+            && now.duration_since(self.started) >= std::time::Duration::from_millis(250)
+            && self.last_draw.map_or(true, |last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(200)
+            })
+        {
+            self.render(now, false);
+        }
+    }
+
+    fn finish_file(&mut self) {
+        if !self.active {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.done = self.total;
+        if self.shown || now.duration_since(self.started) >= std::time::Duration::from_millis(250) {
+            self.render(now, true);
+        }
+        self.active = false;
+        self.shown = false;
+    }
+
+    fn render(&mut self, now: std::time::Instant, complete: bool) {
+        let percent = (u128::from(self.done) * 100 / u128::from(self.total)) as u64;
+        let elapsed = now.duration_since(self.started).as_secs_f64();
+        let rate = if elapsed > 0.0 { (self.done as f64 / elapsed) as u64 } else { 0 };
+        let line = format!(
+            "   [{}/{}] {}  {:3}%  {}/{}  {}/s",
+            self.index,
+            self.count,
+            self.path,
+            percent,
+            human_bytes(self.done),
+            human_bytes(self.total),
+            human_bytes(rate)
+        );
+        self.write_line(&line, complete);
+        self.shown = true;
+        self.last_draw = Some(now);
+    }
+
+    fn clear(&mut self) {
+        self.clear_line();
+        self.active = false;
+        self.shown = false;
+    }
+
+    fn clear_line(&mut self) {
+        if self.visible && self.line_visible {
+            let _ = write!(self.out, "\r{:width$}\r", "", width = self.line_width);
+            let _ = self.out.flush();
+        }
+        self.line_width = 0;
+        self.line_visible = false;
+    }
+
+    fn write_line(&mut self, line: &str, complete: bool) {
+        if !self.visible {
+            return;
+        }
+        let width = line.chars().count();
+        let padding = self.line_width.saturating_sub(width);
+        let _ = write!(self.out, "\r{line}{:padding$}", "");
+        if complete {
+            let _ = writeln!(self.out);
+            self.line_width = 0;
+            self.line_visible = false;
+        } else {
+            self.line_width = width;
+            self.line_visible = true;
+        }
+        let _ = self.out.flush();
+    }
+}
+
+impl Drop for Progress<'_> {
+    fn drop(&mut self) {
+        if self.visible && self.line_visible {
+            let _ = writeln!(self.out);
+            let _ = self.out.flush();
+        }
+    }
 }
 
 // ----------------------------------------------- paths and temporary files
@@ -227,6 +391,16 @@ fn make_dirs(root: &Path, dest: &Path) -> Result<()> {
 
 fn temp_file(parent: &Path) -> Result<tempfile::NamedTempFile> {
     Ok(tempfile::Builder::new().prefix(".bbrsync-").suffix(TMP_SUFFIX).tempfile_in(parent)?)
+}
+
+fn partial_paths(root: &Path, rel: &str, content: &Hash) -> [PathBuf; 2] {
+    let mut key = blake3::Hasher::new();
+    key.update(b"bbrsync-partial-v1\0");
+    key.update(rel.as_bytes());
+    key.update(content);
+    let key = key.finalize().to_hex();
+    let dir = root.join(PARTIAL_DIR);
+    [dir.join(format!("{key}.0")), dir.join(format!("{key}.1"))]
 }
 
 // ------------------------------------------- hashing, caching and scanning
@@ -484,10 +658,15 @@ impl Plan {
 
 // --------------------------------------------------------- framed messages
 
-fn send(w: &mut impl Write, msg: &Msg) -> Result<()> {
+fn write_msg(w: &mut impl Write, msg: &Msg) -> Result<()> {
     let body = bincode::serialize(msg)?;
     w.write_all(&u32::try_from(body.len())?.to_le_bytes())?;
     w.write_all(&body)?;
+    Ok(())
+}
+
+fn send(w: &mut impl Write, msg: &Msg) -> Result<()> {
+    write_msg(w, msg)?;
     w.flush()?;
     Ok(())
 }
@@ -513,17 +692,35 @@ fn send_error(w: &mut impl Write, msg: impl std::fmt::Display) {
 
 // ---------------------------------------------- shared sender and receiver
 
-fn chunk_index(entry: Option<&Entry>) -> HashMap<Hash, (u64, u64)> {
-    entry.into_iter().flat_map(|e| &e.chunks).map(|c| (c.hash, (c.start, c.len))).collect()
+fn chunks_index(chunks: &[ChunkRef]) -> HashMap<Hash, (u64, u64)> {
+    chunks.iter().map(|chunk| (chunk.hash, (chunk.start, chunk.len))).collect()
 }
 
-fn send_chunks(w: &mut impl Write, root: &Path, fresh: &Cache, needs: &[FileNeed]) -> Result<()> {
-    for need in needs {
+fn chunk_index(entry: Option<&Entry>) -> HashMap<Hash, (u64, u64)> {
+    entry.map_or_else(HashMap::new, |entry| chunks_index(&entry.chunks))
+}
+
+fn send_chunks(
+    w: &mut impl Write,
+    root: &Path,
+    fresh: &Cache,
+    needs: &[FileNeed],
+    progress: &mut Progress<'_>,
+) -> Result<()> {
+    for (index, need) in needs.iter().enumerate() {
         let entry = fresh.get(&need.path).context("peer requested an unknown file")?;
         if need.send.len() != entry.chunks.len() {
             bail!("invalid chunk needs for {}", need.path);
         }
-        if !need.send.iter().any(|s| *s) {
+        let total = entry
+            .chunks
+            .iter()
+            .zip(&need.send)
+            .filter(|(_, want)| **want)
+            .map(|(chunk, _)| chunk.len)
+            .sum();
+        progress.begin_file(index + 1, needs.len(), &need.path, total);
+        if total == 0 {
             continue;
         }
         let mut f = BufReader::with_capacity(1 << 20, File::open(safe_join(root, &need.path)?)?);
@@ -532,9 +729,18 @@ fn send_chunks(w: &mut impl Write, root: &Path, fresh: &Cache, needs: &[FileNeed
                 f.seek(SeekFrom::Start(chunk.start))?;
                 let mut data = vec![0u8; chunk.len as usize];
                 f.read_exact(&mut data)?;
-                send(w, &Msg::Chunk(data))?;
+                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+                encoder.write_all(&data)?;
+                let packed = encoder.finish()?;
+                if packed.len() < data.len() {
+                    write_msg(w, &Msg::Chunk { compressed: true, data: packed })?;
+                } else {
+                    write_msg(w, &Msg::Chunk { compressed: false, data })?;
+                }
+                progress.advance(chunk.len);
             }
         }
+        progress.finish_file();
     }
     send(w, &Msg::Done)
 }
@@ -545,47 +751,81 @@ fn assemble(
     root: &Path,
     refs: &[FileRef],
     have: &Cache,
+    partials: &HashMap<String, Partial>,
     stream: &mut impl Read,
+    progress: &mut Progress<'_>,
 ) -> Result<(u64, u64, Vec<(String, Entry)>)> {
     let mut staged = Vec::new();
     let (mut received, mut written) = (0, 0);
-    for f in refs {
+    for (index, f) in refs.iter().enumerate() {
+        let partial = partials.get(&f.path).context("missing partial transfer state")?;
+        let local_at = chunk_index(have.get(&f.path));
+        let partial_at = partial
+            .input
+            .as_ref()
+            .map_or_else(HashMap::new, |(_, chunks)| chunks_index(chunks));
+        let total = f
+            .chunks
+            .iter()
+            .filter(|chunk| !local_at.contains_key(&chunk.hash) && !partial_at.contains_key(&chunk.hash))
+            .map(|chunk| chunk.len)
+            .sum();
+        progress.begin_file(index + 1, refs.len(), &f.path, total);
         let dest = safe_join(root, &f.path)?;
         make_dirs(root, &dest)?;
-        let mut tmp = temp_file(dest.parent().context("missing file parent")?)?;
-        // Updating content must not make a private file public or remove +x.
+        let mut tmp = OpenOptions::new().create(true).truncate(true).write(true).open(&partial.output)?;
         let permissions = match fs::metadata(&dest) {
             Ok(md) => Some(md.permissions()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        if let Some(p) = permissions {
-            tmp.as_file().set_permissions(p)?;
+        if let Some(permissions) = permissions {
+            tmp.set_permissions(permissions)?;
         } else {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                tmp.as_file().set_permissions(fs::Permissions::from_mode(0o644))?;
+                tmp.set_permissions(fs::Permissions::from_mode(0o644))?;
             }
         }
-        let local_at = chunk_index(have.get(&f.path));
-        let mut existing = if f.chunks.iter().any(|c| local_at.contains_key(&c.hash)) {
+        let mut existing = if f.chunks.iter().any(|chunk| local_at.contains_key(&chunk.hash)) {
             Some(BufReader::with_capacity(1 << 20, File::open(&dest)?))
         } else {
             None
         };
+        let mut saved = match &partial.input {
+            Some((path, _)) if !partial_at.is_empty() => {
+                Some(BufReader::with_capacity(1 << 20, File::open(path)?))
+            }
+            _ => None,
+        };
         for chunk in &f.chunks {
-            let data = if let Some((start, len)) = local_at.get(&chunk.hash) {
-                let rd = existing.as_mut().context("missing local reader")?;
-                rd.seek(SeekFrom::Start(*start))?;
+            let (data, transferred) = if let Some((start, len)) = local_at.get(&chunk.hash) {
+                let reader = existing.as_mut().context("missing local reader")?;
+                reader.seek(SeekFrom::Start(*start))?;
                 let mut data = vec![0u8; *len as usize];
-                rd.read_exact(&mut data)?;
-                data
+                reader.read_exact(&mut data)?;
+                (data, false)
+            } else if let Some((start, len)) = partial_at.get(&chunk.hash) {
+                let reader = saved.as_mut().context("missing partial reader")?;
+                reader.seek(SeekFrom::Start(*start))?;
+                let mut data = vec![0u8; *len as usize];
+                reader.read_exact(&mut data)?;
+                (data, false)
             } else {
                 match recv(stream)? {
-                    Msg::Chunk(data) => {
+                    Msg::Chunk { compressed, data } => {
                         received += data.len() as u64;
-                        data
+                        let data = if compressed {
+                            let mut unpacked = Vec::with_capacity(chunk.len as usize);
+                            DeflateDecoder::new(data.as_slice())
+                                .take(chunk.len + 1)
+                                .read_to_end(&mut unpacked)?;
+                            unpacked
+                        } else {
+                            data
+                        };
+                        (data, true)
                     }
                     _ => bail!("expected a chunk for {}", f.path),
                 }
@@ -595,29 +835,52 @@ fn assemble(
             }
             tmp.write_all(&data)?;
             written += data.len() as u64;
+            if transferred {
+                progress.advance(data.len() as u64);
+            }
         }
-        tmp.as_file().sync_all()?;
-        let (content, chunks) = describe(tmp.path())?;
+        tmp.sync_all()?;
+        drop(tmp);
+        let (content, chunks) = describe(&partial.output)?;
         if content != f.content {
             bail!("content mismatch in {}", f.path);
         }
-        staged.push((f.path.clone(), tmp.into_temp_path(), content, chunks));
+        progress.finish_file();
+        staged.push((f.path.clone(), partial.output.clone(), partial.slots.clone(), content, chunks));
     }
     match recv(stream)? {
         Msg::Done => {}
         _ => bail!("expected the end of the chunk stream"),
     }
     let mut published = Vec::new();
-    for (rel, tmp, content, chunks) in staged {
+    for (rel, tmp, slots, content, chunks) in staged {
         let dest = safe_join(root, &rel)?;
-        tmp.persist(&dest)?;
+        tempfile::TempPath::try_from_path(tmp)?.persist(&dest)?;
+        for slot in slots {
+            match fs::remove_file(slot) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let md = fs::metadata(dest)?;
         published.push((rel, Entry { size: md.len(), mtime: mtime_ns(&md), content, chunks }));
+    }
+    match fs::remove_dir(root.join(PARTIAL_DIR)) {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => {}
+        Err(e) => return Err(e.into()),
     }
     Ok((received, written, published))
 }
 
-fn send_tree(w: &mut impl Write, r: &mut impl Read, local: &Local, opts: &Opts) -> Result<Stats> {
+fn send_tree(
+    w: &mut impl Write,
+    r: &mut impl Read,
+    local: &Local,
+    opts: &Opts,
+    progress: &mut Progress<'_>,
+) -> Result<Stats> {
     let theirs = match recv(r)? {
         Msg::Files(files) => files,
         _ => bail!("expected receiver's file list"),
@@ -645,7 +908,7 @@ fn send_tree(w: &mut impl Write, r: &mut impl Read, local: &Local, opts: &Opts) 
             Msg::Needs(files) => files,
             _ => bail!("expected chunk needs"),
         };
-        send_chunks(w, &local.root, &local.entries, &needs)?;
+        send_chunks(w, &local.root, &local.entries, &needs, progress)?;
     }
     match recv(r)? {
         Msg::Ok(stats) => Ok(stats),
@@ -658,6 +921,7 @@ fn receive_tree(
     r: &mut impl Read,
     local: &mut Local,
     opts: &Opts,
+    progress: &mut Progress<'_>,
 ) -> Result<Stats> {
     let files = local.entries.iter().map(|(p, e)| (p.clone(), e.content)).collect();
     send(w, &Msg::Files(files))?;
@@ -670,21 +934,91 @@ fn receive_tree(
     if opts.dry {
         plan.print();
     } else {
+        fs::create_dir_all(&local.root)?;
+        let mut stack = vec![local.root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() && name.starts_with(".bbrsync-") && name.ends_with(TMP_SUFFIX) {
+                    fs::remove_file(entry.path())?;
+                } else if metadata.is_dir() && !is_link(&metadata) && name != PARTIAL_DIR {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        let partial_dir = local.root.join(PARTIAL_DIR);
+        fs::create_dir_all(&partial_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&partial_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let expected: BTreeSet<_> = plan
+            .refs
+            .iter()
+            .flat_map(|file| partial_paths(&local.root, &file.path, &file.content))
+            .collect();
+        for entry in fs::read_dir(&partial_dir)? {
+            let entry = entry?;
+            if !expected.contains(&entry.path()) {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() || is_link(&metadata) {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        let mut partials = HashMap::new();
+        for file in &plan.refs {
+            let slots = partial_paths(&local.root, &file.path, &file.content);
+            let wanted: HashMap<_, _> = file.chunks.iter().map(|chunk| (chunk.hash, chunk.len)).collect();
+            let mut best = None;
+            for (index, path) in slots.iter().enumerate() {
+                match fs::metadata(path) {
+                    Ok(metadata) if metadata.is_file() => match describe(path) {
+                        Ok((_, chunks)) => {
+                            let useful = chunks
+                                .iter()
+                                .filter(|chunk| wanted.get(&chunk.hash) == Some(&chunk.len))
+                                .map(|chunk| chunk.len)
+                                .sum::<u64>();
+                            if useful > best.as_ref().map_or(0, |(_, useful, _)| *useful) {
+                                best = Some((index, useful, chunks));
+                            }
+                        }
+                        Err(_) => fs::remove_file(path)?,
+                    },
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let (input, output) = match best {
+                Some((index, useful, chunks)) if useful > 0 => {
+                    (Some((slots[index].clone(), chunks)), slots[1 - index].clone())
+                }
+                _ => (None, slots[0].clone()),
+            };
+            partials.insert(file.path.clone(), Partial { slots, input, output });
+        }
         let needs = plan
             .refs
             .iter()
-            .map(|f| {
-                let held = chunk_index(local.entries.get(&f.path));
+            .map(|file| {
+                let mut held = chunk_index(local.entries.get(&file.path));
+                if let Some((_, chunks)) = &partials[&file.path].input {
+                    held.extend(chunks_index(chunks));
+                }
                 FileNeed {
-                    path: f.path.clone(),
-                    send: f.chunks.iter().map(|c| !held.contains_key(&c.hash)).collect(),
+                    path: file.path.clone(),
+                    send: file.chunks.iter().map(|chunk| !held.contains_key(&chunk.hash)).collect(),
                 }
             })
             .collect();
         send(w, &Msg::Needs(needs))?;
-        fs::create_dir_all(&local.root)?;
         let (received, assembled, published) =
-            assemble(&local.root, &plan.refs, &local.entries, r)?;
+            assemble(&local.root, &plan.refs, &local.entries, &partials, r, progress)?;
         stats = Stats { files: published.len() as u64, received, assembled, deleted: 0 };
         local.entries.extend(published);
         // Only planned deletions, after every file has verified and published.
@@ -706,14 +1040,18 @@ fn transfer(
     cache_dir: &Path,
     sending: bool,
     opts: &Opts,
+    progress: &mut Progress<'_>,
 ) -> Result<Stats> {
     let result = (|| {
+        progress.status("scanning local files...");
         let mut local = Local::scan(root, cache_dir, opts, !sending)?;
+        progress.status("comparing with peer...");
         let stats = if sending {
-            send_tree(w, r, &local, opts)?
+            send_tree(w, r, &local, opts, progress)?
         } else {
-            receive_tree(w, r, &mut local, opts)?
+            receive_tree(w, r, &mut local, opts, progress)?
         };
+        progress.clear();
         if !opts.dry {
             if let Err(e) = save_cache(&cache_path(cache_dir, &local.root), &local.entries) {
                 eprintln!("warning: could not save hash cache: {e:#}");
@@ -721,6 +1059,7 @@ fn transfer(
         }
         Ok(stats)
     })();
+    progress.clear();
     if let Err(e) = &result {
         send_error(w, format!("{e:#}"));
     }
@@ -740,6 +1079,7 @@ fn human_bytes(n: u64) -> String {
 }
 
 fn sync(
+    transport: &dyn Transport,
     local: &Path,
     remote: &str,
     host: &str,
@@ -747,6 +1087,7 @@ fn sync(
     cache_dir: &Path,
     pull: bool,
     opts: &Opts,
+    hide_progress: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
     let local = if pull {
@@ -762,10 +1103,9 @@ fn sync(
         (&local_label, &remote_label)
     };
     println!("source: {source}\ndest:   {dest}");
-    let sock = TcpStream::connect(host).with_context(|| format!("connecting to {host}"))?;
-    sock.set_nodelay(true).ok();
-    let mut w = BufWriter::with_capacity(64 << 10, sock.try_clone()?);
-    let mut r = BufReader::with_capacity(64 << 10, sock);
+    let Connection { reader, writer } = transport.connect(host)?;
+    let mut w = BufWriter::with_capacity(64 << 10, writer);
+    let mut r = BufReader::with_capacity(64 << 10, reader);
     send(
         &mut w,
         &Msg::Hello {
@@ -781,7 +1121,10 @@ fn sync(
         Msg::Ready { version } => bail!("daemon speaks v{version}, this build speaks v{VERSION}"),
         _ => bail!("unexpected reply to hello"),
     }
-    let stats = transfer(&mut w, &mut r, &local, cache_dir, !pull, opts)?;
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let mut progress = Progress::new(!hide_progress && !opts.dry, &mut stderr);
+    let stats = transfer(&mut w, &mut r, &local, cache_dir, !pull, opts, &mut progress)?;
     if !opts.dry {
         let elapsed = started.elapsed();
         let secs = elapsed.as_secs_f64();
@@ -801,9 +1144,10 @@ fn sync(
     Ok(())
 }
 
-fn session(sock: TcpStream, base: Option<&Path>, token: &str, cache_dir: &Path) -> Result<()> {
-    let mut w = BufWriter::with_capacity(64 << 10, sock.try_clone()?);
-    let mut r = BufReader::with_capacity(64 << 10, sock);
+fn session(connection: Connection, base: Option<&Path>, token: &str, cache_dir: &Path) -> Result<()> {
+    let Connection { reader, writer } = connection;
+    let mut w = BufWriter::with_capacity(64 << 10, writer);
+    let mut r = BufReader::with_capacity(64 << 10, reader);
     let hello = (|| match recv(&mut r)? {
         Msg::Hello { version, token: t, path, pull, opts } => {
             if version != VERSION {
@@ -824,11 +1168,13 @@ fn session(sock: TcpStream, base: Option<&Path>, token: &str, cache_dir: &Path) 
         }
     };
     send(&mut w, &Msg::Ready { version: VERSION })?;
-    transfer(&mut w, &mut r, &root, cache_dir, pull, &opts)?;
+    let mut sink = std::io::sink();
+    let mut progress = Progress::new(false, &mut sink);
+    transfer(&mut w, &mut r, &root, cache_dir, pull, &opts, &mut progress)?;
     Ok(())
 }
 
-fn serve(base: Option<&Path>, listen: &str, token: &str, cache_dir: &Path) -> Result<()> {
+fn serve(transports: &[&dyn Transport], base: Option<&Path>, listen: &str, token: &str, cache_dir: &Path) -> Result<()> {
     // `--root` is optional: it confines clients to a subtree, but each client
     // still names its own path.
     let base = match base {
@@ -839,19 +1185,31 @@ fn serve(base: Option<&Path>, listen: &str, token: &str, cache_dir: &Path) -> Re
         None => None,
     };
     match &base {
-        Some(b) => eprintln!("bbrsync serving on {listen}, confined to {}", b.display()),
-        None => eprintln!("bbrsync serving on {listen}"),
+        Some(b) => eprintln!("bbrsync serving TCP and KCP on {listen}, confined to {}", b.display()),
+        None => eprintln!("bbrsync serving TCP and KCP on {listen}"),
     }
-    let listener = TcpListener::bind(listen).with_context(|| format!("binding {listen}"))?;
-    for conn in listener.incoming() {
-        match conn {
-            Ok(sock) => {
-                sock.set_nodelay(true).ok();
-                if let Err(e) = session(sock, base.as_deref(), token, cache_dir) {
+    let incoming = transports.iter().map(|transport| transport.incoming(listen))
+        .collect::<Result<Vec<_>>>()?;
+    let (accepted, connections) = std::sync::mpsc::sync_channel(8);
+    for (index, incoming) in incoming.into_iter().enumerate() {
+        let accepted = accepted.clone();
+        std::thread::Builder::new().name(format!("bbrsync-accept-{index}")).spawn(move || {
+            for connection in incoming {
+                if accepted.send(connection).is_err() {
+                    break;
+                }
+            }
+        }).context("starting transport listener")?;
+    }
+    drop(accepted);
+    for connection in connections {
+        match connection {
+            Ok(connection) => {
+                if let Err(e) = session(connection, base.as_deref(), token, cache_dir) {
                     eprintln!("session ended: {e:#}");
                 }
             }
-            Err(e) => eprintln!("accept failed: {e}"),
+            Err(e) => eprintln!("accept failed: {e:#}"),
         }
     }
     Ok(())
@@ -914,6 +1272,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
         std::env::var("BBRSYNC_TOKEN").unwrap_or_default()
     };
     let mut opts = Opts::default();
+    let mut hide_progress = false;
+    let mut kcp = false;
     let mut ignore = Vec::new();
     while let Some(arg) = args.next() {
         let (key, inline) = match arg.split_once('=') {
@@ -960,6 +1320,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("--dry-run", false) if inline.is_none() => opts.dry = true,
             ("--full", false) if inline.is_none() => opts.full = true,
             ("--delete", false) if inline.is_none() => opts.delete = true,
+            ("--hide-progress", false) if inline.is_none() => hide_progress = true,
+            ("--kcp", false) if inline.is_none() => kcp = true,
             ("--version", _) if inline.is_none() => {
                 println!("bbrsync {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -971,7 +1333,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
             ("-h" | "--help", _) if inline.is_none() => {
                 println!(
                     "usage:\n  \
-                     bbrsync --source=PATH --dest=PATH [--dry-run] [--delete] [--full] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
+                     bbrsync --source=PATH --dest=PATH [--kcp] [--dry-run] [--delete] [--full] [--hide-progress] [--ignore PATTERN] [--cache-dir DIR] [--token TOKEN]\n  \
                      bbrsync serve --listen=ADDRESS:PORT [--root=DIR] [--cache-dir=DIR] [--token=TOKEN]\n\n\
                      --source is read from; --dest receives changes. Their order does not matter.\n\
                      Exactly one endpoint is remote: HOST:PORT/PATH. The other is a local directory.\n\n  \
@@ -980,6 +1342,8 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
                      Windows drive paths such as C:\\Sites\\website are local. Quote paths containing spaces.\n\
                      --dry-run previews without writes. --delete also removes destination-only files.\n\
                      --cache-dir overrides this process's operating-system cache directory.\n\
+                     --kcp uses the daemon's reliable UDP transport; TCP is the default.\n\
+                     Transfers show progress on standard error; --hide-progress suppresses it.\n\
                      Existing destination files can be overwritten even without --delete. Keep backups.\n\
                      Use only on a trusted local network or VPN; traffic is not encrypted.\n\
                      --version prints the version; --license prints the MIT license."
@@ -998,6 +1362,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
     };
     if serving {
         return serve(
+            &[&transport::tcp::TCP, &transport::kcp::KCP],
             root.as_deref().map(Path::new),
             &listen.context("missing --listen=ADDRESS:PORT")?,
             &token,
@@ -1008,7 +1373,18 @@ fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let dest = dest.context("missing --dest=PATH")?;
     let (local, remote, host, pull) = parse_endpoints(&source, &dest)?;
     opts.patterns = load_patterns(Path::new(local), &ignore)?;
-    sync(Path::new(local), remote, host, &token, &cache_dir, pull, &opts)
+    let transport: &dyn Transport = if kcp { &transport::kcp::KCP } else { &transport::tcp::TCP };
+    sync(
+        transport,
+        Path::new(local),
+        remote,
+        host,
+        &token,
+        &cache_dir,
+        pull,
+        &opts,
+        hide_progress,
+    )
 }
 
 fn main() -> Result<()> {
