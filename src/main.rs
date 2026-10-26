@@ -123,7 +123,6 @@ struct Progress<'a> {
     out: &'a mut dyn Write,
     visible: bool,
     active: bool,
-    shown: bool,
     index: usize,
     count: usize,
     path: String,
@@ -141,7 +140,6 @@ impl<'a> Progress<'a> {
             out,
             visible,
             active: false,
-            shown: false,
             index: 0,
             count: 0,
             path: String::new(),
@@ -159,14 +157,12 @@ impl<'a> Progress<'a> {
             return;
         }
         self.active = false;
-        self.shown = false;
         self.write_line(&format!("   {text}"), false);
     }
 
     fn begin_file(&mut self, index: usize, count: usize, path: &str, total: u64) {
         self.clear_line();
         self.active = self.visible && total > 0;
-        self.shown = false;
         self.index = index;
         self.count = count;
         self.path = if path.chars().count() <= 48 {
@@ -204,11 +200,8 @@ impl<'a> Progress<'a> {
         }
         let now = std::time::Instant::now();
         self.done = self.total;
-        if self.shown || now.duration_since(self.started) >= std::time::Duration::from_millis(250) {
-            self.render(now, true);
-        }
+        self.render(now, true);
         self.active = false;
-        self.shown = false;
     }
 
     fn render(&mut self, now: std::time::Instant, complete: bool) {
@@ -226,14 +219,12 @@ impl<'a> Progress<'a> {
             human_bytes(rate)
         );
         self.write_line(&line, complete);
-        self.shown = true;
         self.last_draw = Some(now);
     }
 
     fn clear(&mut self) {
         self.clear_line();
         self.active = false;
-        self.shown = false;
     }
 
     fn clear_line(&mut self) {

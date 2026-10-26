@@ -515,7 +515,7 @@ fn missing_duplicate_and_unnamed_arguments_are_rejected_before_endpoint_resoluti
 }
 
 #[test]
-fn progress_can_be_hidden_and_rewrites_the_active_line() {
+fn progress_can_be_hidden_and_keeps_one_completed_row_per_file() {
     let mut redirected = Vec::new();
     {
         let mut progress = Progress::new(false, &mut redirected);
@@ -530,16 +530,19 @@ fn progress_can_be_hidden_and_rewrites_the_active_line() {
     let mut interactive = Vec::new();
     {
         let mut progress = Progress::new(true, &mut interactive);
-        progress.status("scanning local files...");
         progress.begin_file(1, 2, "large file.bin", 100);
         progress.started = std::time::Instant::now() - Duration::from_secs(1);
         progress.advance(50);
         progress.finish_file();
+        progress.begin_file(2, 2, "fast file.bin", 10);
+        progress.advance(10);
+        progress.finish_file();
     }
     let interactive = String::from_utf8(interactive).unwrap();
-    assert!(interactive.contains("scanning local files..."));
     assert!(interactive.contains("[1/2] large file.bin   50%"));
     assert!(interactive.contains("[1/2] large file.bin  100%"));
+    assert!(interactive.contains("[2/2] fast file.bin  100%"));
+    assert_eq!(interactive.matches('\n').count(), 2);
     assert!(interactive.contains('\r'));
 }
 

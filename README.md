@@ -88,9 +88,10 @@ not on a dry run. `BBRSYNC_TOKEN` supplies the client's optional token default.
 KCP requires direct UDP reachability to the daemon. A TCP-only proxy or tunnel cannot
 carry it; use TCP unless the daemon's UDP port is reachable through the LAN or VPN.
 
-Real transfers show per-file progress on standard error by default, including from
-Git Bash and redirected processes. Use `--hide-progress` for quiet scripts and log
-capture. Dry runs do not show progress. Totals report compressed chunk payload bytes
+Real transfers update the active file's progress in place and keep one completed
+row per transferred file on standard error, including from Git Bash and redirected
+processes. Use `--hide-progress` for quiet scripts and log capture. Dry runs do not
+show progress. Totals report compressed chunk payload bytes
 sent across the network, excluding chunks reused at the destination.
 
 ## Deletion safety
