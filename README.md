@@ -87,6 +87,8 @@ not on a dry run. `BBRSYNC_TOKEN` supplies the client's optional token default.
 
 KCP requires direct UDP reachability to the daemon. A TCP-only proxy or tunnel cannot
 carry it; use TCP unless the daemon's UDP port is reachable through the LAN or VPN.
+TCP connection attempts fail after 15 seconds instead of inheriting an unbounded
+operating-system connection wait.
 
 Real transfers update the active file's progress in place and keep one completed
 row per transferred file on standard error, including from Git Bash and redirected
